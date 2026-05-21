@@ -42,32 +42,36 @@ The shaping uses MDP-verified game stats to prevent reward exploitation — earl
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     Experiments                          │
-│              run_pair.py  /  sweep_pairs.py              │
-├─────────────────────────────────────────────────────────┤
-│  Agent 0 (PGAgent/PPO)      Agent 1 (PGAgent/PPO)       │
-│  ┌─────────────────────┐   ┌─────────────────────┐      │
-│  │ ActorCritic (1040→  │   │ ActorCritic (1040→  │      │
-│  │  256→6/1)           │   │  256→6/1)           │      │
-│  │ GAE + PPO Clip +    │   │ GAE + PPO Clip +    │      │
-│  │ Multi-epoch replay  │   │ Multi-epoch replay  │      │
-│  └─────────────────────┘   └─────────────────────┘      │
-├─────────────────────────────────────────────────────────┤
-│                  OvercookedWrapper                       │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │  • lossless_state_encoding (~1040-dim obs)       │   │
-│  │  • Reward shaping (game_stats-verified)          │   │
-│  │  • Custom layout support (from_grid)             │   │
-│  │  • GPU auto-detection with occupancy check       │   │
-│  └──────────────────────────────────────────────────┘   │
-├─────────────────────────────────────────────────────────┤
-│                  Event Tracker (per-step)                │
-│  Pickups │ Pot placements │ Deliveries │ Actions │ Stay │
-├─────────────────────────────────────────────────────────┤
-│              Overcooked-AI (OvercookedGridworld)         │
-│               MDP dynamics, state transitions            │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                       Experiments                            │
+│                run_pair.py  /  sweep_pairs.py                │
+├──────────────────────────────────────────────────────────────┤
+│                          --algo                              │
+│          ippo                         mappo                  │
+│  ┌───────────────────┐    ┌─────────────────────────────┐   │
+│  │ Agent 0  Agent 1  │    │   CentralizedCritic V(s)    │   │
+│  │ (PGAgent) (PGAgent)│    │   ┌──────────┐              │   │
+│  │ ┌──────┐ ┌──────┐ │    │   │ Actor 0  │  Actor 1     │   │
+│  │ │Actor │ │Actor │ │    │   │ (policy) │  (policy)    │   │
+│  │ │Critic│ │Critic│ │    │   └──────────┘              │   │
+│  │ └──────┘ └──────┘ │    │   Shared GAE advantage       │   │
+│  │ Separate GAE + PPO │    │   CTDE: centralized training │   │
+│  └───────────────────┘    └─────────────────────────────┘   │
+├──────────────────────────────────────────────────────────────┤
+│                     OvercookedWrapper                        │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  • lossless_state_encoding (~1040-dim obs)            │  │
+│  │  • Reward shaping (game_stats-verified)               │  │
+│  │  • Custom layout support (from_grid)                  │  │
+│  │  • GPU auto-detection with occupancy check            │  │
+│  └───────────────────────────────────────────────────────┘  │
+├──────────────────────────────────────────────────────────────┤
+│                   Event Tracker (per-step)                   │
+│   Pickups │ Pot placements │ Deliveries │ Actions │ Stay    │
+├──────────────────────────────────────────────────────────────┤
+│               Overcooked-AI (OvercookedGridworld)            │
+│                 MDP dynamics, state transitions              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### PPO Agent (PGAgent)
@@ -77,6 +81,15 @@ The shaping uses MDP-verified game stats to prevent reward exploitation — earl
 - **Value loss**: MSE, coefficient 0.5
 - **Entropy bonus**: coefficient 0.05 (prevents premature convergence)
 - **Gradient clipping**: max norm 0.5
+
+### MAPPO (Multi-Agent PPO) — `--algo mappo`
+- **Paradigm**: CTDE (Centralized Training, Decentralized Execution)
+- **Actors**: Two decentralized ActorCritic networks, each outputting independent action policies
+- **Critic**: One centralized 3-layer MLP V(s_global) — same architecture as PGAgent critic but sees full global state
+- **Advantage**: Both actors share the same team advantage computed by the centralized critic via GAE
+- **Actor update**: PPO clipped surrogate (same hyperparams as IPPO), no per-actor value loss term
+- **Critic update**: MSE regression on returns, independent optimizer
+- **Key difference from IPPO**: Rather than each agent learning its own value function from its own perspective, MAPPO uses a single centralized critic that sees the full global state — this stabilizes value estimation in cooperative tasks where individual observations are partial or noisy
 
 ### Observation Space
 The `lossless_state_encoding` from Overcooked-AI provides a full grid state representation:
@@ -96,10 +109,15 @@ pip install -e .
 ## Quick Start
 
 ```bash
-# Single training run (PPO agents, 100 episodes, CPU)
+# IPPO: Independent PPO learners (default)
 python overcooked_speed/experiments/run_pair.py \
     --layout cramped_room --agent0 nl --agent1 nl \
     --num_episodes 100 --seed 0 --log_dir logs/demo
+
+# MAPPO: Centralized-critic multi-agent PPO (strong baseline)
+python overcooked_speed/experiments/run_pair.py \
+    --layout cramped_room --algo mappo --agent0 nl --agent1 nl \
+    --num_episodes 100 --seed 0 --log_dir logs/demo_mappo
 
 # Multi-seed sweep (500 episodes × 3 seeds, GPU auto-detect)
 python overcooked_speed/experiments/sweep_pairs.py \
@@ -128,6 +146,7 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 | `--reward_shaping` | True | Enable intermediate milestone rewards |
 | `--ent_coef` | 0.05 | Entropy bonus coefficient |
 | `--ppo_epochs` | 4 | PPO update epochs per episode |
+| `--algo` | `ippo` | Algorithm: `ippo` (independent PPO) or `mappo` (centralized-critic MAPPO) |
 | `--log_dir` | `logs/smoke` | Output directory for CSVs and summary JSON |
 
 `sweep_pairs.py` adds:
@@ -136,6 +155,7 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 |------|---------|-------------|
 | `--pairs` | `nl,nl` | Comma-separated agent0,agent1 types |
 | `--seeds` | `0 1 2` | Random seeds for multi-seed averaging |
+| `--algo` | `ippo` | Algorithm: `ippo` or `mappo` |
 
 ## Key Findings (v5: game_stats-verified reward shaping)
 
@@ -156,6 +176,16 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 2. **Specialization precedes convergence**: T_spec ≈ 47 vs T_reward ≈ 222 — agents learn *who does what* long before they learn *how to do it well*
 3. **Delivery specialization (0.90) > Cooking specialization (0.72)**: the delivery role is more sharply divided because only one agent can deliver at the serving station at a time
 4. **Reward shaping anti-exploitation**: using `game_stats['potting_onion']` delta (MDP-verified) prevents the reward hacking seen in earlier versions where agents spammed onion pickups without progressing the task
+
+**MAPPO (Centralized Critic)** is now available via `--algo mappo` as a strong CTDE baseline. It adds the following per-episode CSV fields beyond the standard IPPO ones:
+
+| Field | Description |
+|-------|-------------|
+| `critic_loss` | Centralized critic MSE loss |
+| `value_mean` | Mean V(s) across episode timesteps |
+| `advantage_mean` | Mean GAE advantage (before normalization) |
+
+MAPPO serves as a comparison point for future teammate-aware methods (LOLA, Lookahead) — if MAPPO's centralized critic substantially outperforms IPPO, it suggests value estimation (not policy optimization) is the bottleneck in this cooperative task.
 
 ### Reward Shaping Evolution
 
@@ -179,7 +209,8 @@ overcooked/
 │
 ├── overcooked_speed/                 # Research framework (this project)
 │   ├── agents/
-│   │   ├── pg_agent.py               # PPO agent with GAE + clip
+│   │   ├── pg_agent.py               # IPPO agent with GAE + clip
+│   │   ├── mappo_agent.py            # MAPPO: centralized critic + two actors
 │   │   └── policy.py                 # Actor-Critic network (shared MLP)
 │   ├── envs/
 │   │   ├── overcooked_wrapper.py     # Unified env API + reward shaping
@@ -211,6 +242,9 @@ Implement and benchmark agents that account for *other agents' learning*:
 | **LOLA** (Learning with Opponent-Learning Awareness) | Each agent differentiates through the *other agent's* policy update when computing its own gradient — anticipating how the co-player will change |
 | **Lookahead** | Simulate k steps of joint learning then take the first gradient step — a form of model-based multi-agent planning |
 | **Ideal Jπ** | Exact analytical joint policy gradient — serves as an upper-bound oracle for cooperative settings |
+
+**Current baseline**: IPPO (independent PPO) and MAPPO (centralized-critic CTDE) are implemented.
+MAPPO provides the centralized-training reference point — LOLA/Lookahead should be compared against both to isolate the benefit of teammate-awareness from the benefit of global-state value estimation.
 
 **Hypothesis**: LOLA and Lookahead should accelerate T_reward (faster convergence) and produce more stable specialization compared to naive learners, because they account for co-adaptation effects that NL agents treat as environmental noise.
 

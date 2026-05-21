@@ -70,6 +70,8 @@ def main():
                         dest='reward_shaping')
     parser.add_argument('--ent_coef', type=float, default=0.05)
     parser.add_argument('--ppo_epochs', type=int, default=4)
+    parser.add_argument('--algo', default='ippo', choices=['ippo', 'mappo'],
+                        help='Algorithm: ippo (independent PPO) or mappo (centralized-critic MAPPO)')
     args = parser.parse_args()
 
     parts = args.pairs.split(',')
@@ -103,6 +105,7 @@ def main():
             ent_coef=args.ent_coef,
             ppo_epochs=args.ppo_epochs,
             device=gpu_id if gpu_id is not None else 'auto',
+            algo=args.algo,
         )
         summary['agent0_type'] = agent0_type
         summary['agent1_type'] = agent1_type

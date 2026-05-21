@@ -3,45 +3,26 @@ requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "overcooked_ai"
-version = "2.0.0"
-description = "Cooperative multi-agent environment based on Overcooked"
+name = "overcooked"
+version = "1.0.0"
+description = "Overcooked-AI environment with multi-agent convergence speed research framework"
 readme = "README.md"
-requires-python = ">=3.10,<3.11"
+requires-python = ">=3.8"
 license = { file = "LICENSE" }
-authors = [{ name = "Micah Carroll", email = "mdc@berkeley.edu" }]
-urls = { homepage = "https://github.com/HumanCompatibleAI/overcooked_ai" }
-keywords = ["Overcooked", "AI", "Reinforcement Learning"]
+authors = [{ name = "Shixian Li" }]
+urls = { homepage = "https://github.com/zxlishixian/overcooked" }
+keywords = ["Overcooked", "MARL", "Reinforcement Learning", "Convergence", "Specialization"]
 dependencies = [
     "dill",
     "gymnasium",
-    "ipywidgets",
     "numpy<2",
     "opencv-python",
     "pygame",
     "scipy",
-    "setuptools>=77.0.3",
     "tqdm",
+    "torch>=1.10.0",
+    "matplotlib",
 ]
-
-[project.optional-dependencies]
-harl = [
-    "ipykernel",
-    "ray[rllib,tune]==2.2",
-    "dm-tree",
-    "lz4",
-    "tensorflow[and-cuda]==2.19.0",
-    "wandb",
-    "gym",
-]
-
-[project.scripts]
-overcooked-demo-up = "overcooked_demo:start_server"
-overcooked-demo-move = "overcooked_demo:move_agent"
-
-[tool.setuptools]
-package-dir = { "" = "src" }
-packages = { find = { where = ["src"] } }
 
 [tool.setuptools.package-data]
 "overcooked_ai_py" = [
@@ -50,13 +31,4 @@ packages = { find = { where = ["src"] } }
     "data/graphics/*.png",
     "data/graphics/*.json",
     "data/fonts/*.ttf",
-]
-"human_aware_rl" = [
-    "static/**/*.pickle",
-    "static/**/*.csv",
-    "ppo/trained_example/*.pkl",
-    "ppo/trained_example/*.json",
-    "ppo/trained_example/*/.is_checkpoint",
-    "ppo/trained_example/*/.tune_metadata",
-    "ppo/trained_example/*/checkpoint-500",
 ]

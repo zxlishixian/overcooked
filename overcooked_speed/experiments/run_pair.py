@@ -26,7 +26,7 @@ from overcooked_speed.analysis.metrics import (
     gated_cooking_specialization,
     gated_overall_specialization,
 )
-from overcooked_speed.agents import create_agent
+from overcooked_speed.agents import create_agent, MAPPOManager
 
 
 def select_device(gpu_id=None):
@@ -61,8 +61,12 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
              reward_threshold=20.0, spec_threshold=0.3,
              min_delivery_events=1, min_cooking_events=3,
              reward_shaping=True, ent_coef=0.05, ppo_epochs=4,
-             device='auto'):
-    """Run one agent pair for num_episodes and log results."""
+             device='auto', algo='ippo'):
+    """Run one agent pair for num_episodes and log results.
+
+    Args:
+        algo: 'ippo' (independent PPO) or 'mappo' (centralized-critic MAPPO).
+    """
 
     np.random.seed(seed)
     import torch
@@ -78,18 +82,24 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
 
     print(f"Using device: {torch_device} (GPU {used_gpu})" if used_gpu >= 0
           else f"Using device: {torch_device}")
+    print(f"Algorithm: {algo.upper()}")
 
     env = OvercookedWrapper(layout_name=layout, horizon=horizon,
                             reward_shaping=reward_shaping)
     obs_dim = env.obs_dim
     n_actions = env.NUM_ACTIONS
 
-    agent0 = create_agent(agent0_type, 0, obs_dim, n_actions, lr, gamma, hidden_dim,
-                          device=torch_device, ent_coef=ent_coef,
-                          ppo_epochs=ppo_epochs)
-    agent1 = create_agent(agent1_type, 1, obs_dim, n_actions, lr, gamma, hidden_dim,
-                          device=torch_device, ent_coef=ent_coef,
-                          ppo_epochs=ppo_epochs)
+    if algo == 'mappo':
+        mappo = MAPPOManager(obs_dim, n_actions, lr=lr, gamma=gamma,
+                             hidden_dim=hidden_dim, device=torch_device,
+                             ppo_epochs=ppo_epochs, ent_coef=ent_coef)
+    else:
+        agent0 = create_agent(agent0_type, 0, obs_dim, n_actions, lr, gamma, hidden_dim,
+                              device=torch_device, ent_coef=ent_coef,
+                              ppo_epochs=ppo_epochs)
+        agent1 = create_agent(agent1_type, 1, obs_dim, n_actions, lr, gamma, hidden_dim,
+                              device=torch_device, ent_coef=ent_coef,
+                              ppo_epochs=ppo_epochs)
 
     tracker = EventTracker()
     episode_rewards = []
@@ -110,12 +120,14 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
                     'a0_grad_norm', 'a1_grad_norm',
                     'a0_approx_kl', 'a1_approx_kl',
                     'a0_value_loss', 'a1_value_loss']
+    mappo_extra = ['critic_loss', 'value_mean', 'advantage_mean']
     spec_fields = ['s_delivery', 's_cooking', 's_overall',
                    's_delivery_gated', 's_cooking_gated', 's_overall_gated']
 
     fieldnames = (base_fields + a0_event_fields + a1_event_fields +
                   a0_action_fields + a1_action_fields +
-                  learn_fields + spec_fields)
+                  learn_fields + (mappo_extra if algo == 'mappo' else []) +
+                  spec_fields)
 
     os.makedirs(log_dir, exist_ok=True)
     csv_path = os.path.join(log_dir, 'episodes.csv')
@@ -129,21 +141,30 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
         obs0, obs1 = env.reset()
         tracker.reset()
 
-        agent0.train()
-        agent1.train()
+        if algo == 'mappo':
+            mappo.train()
+        else:
+            agent0.train()
+            agent1.train()
 
         done = False
         ep_reward = 0.0
 
         while not done:
-            a0 = agent0.act(obs0)
-            a1 = agent1.act(obs1)
+            if algo == 'mappo':
+                a0, a1 = mappo.act(obs0, obs1)
+            else:
+                a0 = agent0.act(obs0)
+                a1 = agent1.act(obs1)
 
             (next_obs0, next_obs1), reward, done, info = env.step((a0, a1))
             tracker.step((a0, a1), info)
 
-            agent0.store_reward(reward)
-            agent1.store_reward(reward)
+            if algo == 'mappo':
+                mappo.store_reward(reward)
+            else:
+                agent0.store_reward(reward)
+                agent1.store_reward(reward)
 
             obs0 = next_obs0
             obs1 = next_obs1
@@ -157,8 +178,26 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
         episode_event_counts.append(counts)
 
         # End-of-episode training
-        a0_log = agent0.end_episode()
-        a1_log = agent1.end_episode()
+        if algo == 'mappo':
+            log = mappo.end_episode()
+            a0_log = {
+                'loss': log['actor0_loss'],
+                'entropy': log['entropy0'],
+                'grad_norm': log['a0_grad_norm'],
+                'approx_kl': log['a0_approx_kl'],
+                'value_loss': log['value_loss'],
+            }
+            a1_log = {
+                'loss': log['actor1_loss'],
+                'entropy': log['entropy1'],
+                'grad_norm': log['a1_grad_norm'],
+                'approx_kl': log['a1_approx_kl'],
+                'value_loss': log['value_loss'],
+            }
+        else:
+            log = {}
+            a0_log = agent0.end_episode()
+            a1_log = agent1.end_episode()
 
         # ── Specialization ──
         c0 = counts[0]
@@ -229,6 +268,10 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
             's_cooking_gated': '' if np.isnan(s_cook_gated) else s_cook_gated,
             's_overall_gated': '' if np.isnan(s_overall_gated) else s_overall_gated,
         }
+        if algo == 'mappo':
+            row['critic_loss'] = log.get('critic_loss', 0)
+            row['value_mean'] = log.get('value_mean', 0)
+            row['advantage_mean'] = log.get('advantage_mean', 0)
         writer.writerow(row)
 
     csv_file.close()
@@ -292,6 +335,8 @@ def main():
                         help='Entropy bonus coefficient (default 0.05)')
     parser.add_argument('--ppo_epochs', type=int, default=4,
                         help='PPO update epochs per episode (default 4)')
+    parser.add_argument('--algo', default='ippo', choices=['ippo', 'mappo'],
+                        help='Algorithm: ippo (independent PPO) or mappo (centralized-critic MAPPO)')
     args = parser.parse_args()
 
     gpu_id = None
@@ -318,6 +363,7 @@ def main():
         ent_coef=args.ent_coef,
         ppo_epochs=args.ppo_epochs,
         device=gpu_id if gpu_id is not None else 'auto',
+        algo=args.algo,
     )
 
 
