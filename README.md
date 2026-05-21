@@ -60,7 +60,8 @@ The shaping uses MDP-verified game stats to prevent reward exploitation — earl
 ├──────────────────────────────────────────────────────────────┤
 │                     OvercookedWrapper                        │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │  • lossless_state_encoding (~1040-dim obs)            │  │
+│  │  • obs_mode: egocentric (~520-dim) / global_concat  │  │
+│  │    (~1040-dim), get_global_obs() for MAPPO critic    │  │
 │  │  • Reward shaping (game_stats-verified)               │  │
 │  │  • Custom layout support (from_grid)                  │  │
 │  │  • GPU auto-detection with occupancy check            │  │
@@ -92,9 +93,25 @@ The shaping uses MDP-verified game stats to prevent reward exploitation — earl
 - **Key difference from IPPO**: Rather than each agent learning its own value function from its own perspective, MAPPO uses a single centralized critic that sees the full global state — this stabilizes value estimation in cooperative tasks where individual observations are partial or noisy
 
 ### Observation Space
-The `lossless_state_encoding` from Overcooked-AI provides a full grid state representation:
-- ~1040 dimensions for cramped_room (5×5 grid)
-- ~2080 dimensions for larger custom layouts
+
+The `lossless_state_encoding_mdp` from Overcooked-AI returns a 2-agent dual-perspective encoding `enc[0], enc[1]` where each perspective is ~520-dim for cramped_room (5×5 grid, 26 channels). The wrapper supports two observation modes via `--obs_mode`:
+
+| Mode | Dim per agent | Agent 0 obs | Agent 1 obs | Use case |
+|------|--------------|-------------|-------------|----------|
+| `egocentric` (default) | ~520 | `enc[0].flatten()` | `enc[1].flatten()` | Fair comparison: IPPO vs MAPPO with same actor input |
+| `global_concat` | ~1040 | `np.array(enc).flatten()` | `np.array(enc).flatten()` (identical) | Idealized upper-bound ablation |
+| `local` | — | — | — | Reserved for future partial-observation work |
+
+**Key design**: In `egocentric` mode, agent 0 and agent 1 receive **different** 520-dim vectors (agent-specific channel ordering), even though the underlying state information is the same. This matters for fair comparison — IPPO agents see the same information as MAPPO actors, and MAPPO's advantage comes only from its centralized critic, which always uses `get_global_obs()` (~1040-dim, regardless of `obs_mode`).
+
+**Fair comparison matrix**:
+
+| Config | Actor obs | Critic obs | What it isolates |
+|--------|-----------|------------|-----------------|
+| IPPO-egocentric | 520-dim ego | 520-dim ego (own critic) | IPPO limited baseline |
+| **MAPPO-egocentric** | **520-dim ego** | **1040-dim global** | **Centralized critic benefit** |
+| IPPO-global_concat | 1040-dim both | 1040-dim both (own critic) | Upper-bound ablation |
+| MAPPO-global_concat | 1040-dim both | 1040-dim global | Upper-bound ablation |
 
 ## Installation
 
@@ -109,14 +126,21 @@ pip install -e .
 ## Quick Start
 
 ```bash
-# IPPO: Independent PPO learners (default)
+# IPPO: Independent PPO learners (default) — egocentric obs
 python overcooked_speed/experiments/run_pair.py \
     --layout cramped_room --agent0 nl --agent1 nl \
     --num_episodes 100 --seed 0 --log_dir logs/demo
 
-# MAPPO: Centralized-critic multi-agent PPO (strong baseline)
+# IPPO with global_concat obs (ablation)
 python overcooked_speed/experiments/run_pair.py \
-    --layout cramped_room --algo mappo --agent0 nl --agent1 nl \
+    --layout cramped_room --algo ippo --obs_mode global_concat \
+    --agent0 nl --agent1 nl \
+    --num_episodes 100 --seed 0 --log_dir logs/demo_ippo_global
+
+# MAPPO: egocentric actors + centralized global critic (key comparison)
+python overcooked_speed/experiments/run_pair.py \
+    --layout cramped_room --algo mappo --obs_mode egocentric \
+    --agent0 nl --agent1 nl \
     --num_episodes 100 --seed 0 --log_dir logs/demo_mappo
 
 # Multi-seed sweep (500 episodes × 3 seeds, GPU auto-detect)
@@ -147,6 +171,7 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 | `--ent_coef` | 0.05 | Entropy bonus coefficient |
 | `--ppo_epochs` | 4 | PPO update epochs per episode |
 | `--algo` | `ippo` | Algorithm: `ippo` (independent PPO) or `mappo` (centralized-critic MAPPO) |
+| `--obs_mode` | `egocentric` | Observation mode: `egocentric` (~520-dim), `global_concat` (~1040-dim), `local` (reserved) |
 | `--log_dir` | `logs/smoke` | Output directory for CSVs and summary JSON |
 
 `sweep_pairs.py` adds:
@@ -156,6 +181,7 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 | `--pairs` | `nl,nl` | Comma-separated agent0,agent1 types |
 | `--seeds` | `0 1 2` | Random seeds for multi-seed averaging |
 | `--algo` | `ippo` | Algorithm: `ippo` or `mappo` |
+| `--obs_mode` | `egocentric` | Observation mode: `egocentric`, `global_concat`, `local` |
 
 ## Key Findings (v5: game_stats-verified reward shaping)
 
@@ -177,13 +203,15 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 3. **Delivery specialization (0.90) > Cooking specialization (0.72)**: the delivery role is more sharply divided because only one agent can deliver at the serving station at a time
 4. **Reward shaping anti-exploitation**: using `game_stats['potting_onion']` delta (MDP-verified) prevents the reward hacking seen in earlier versions where agents spammed onion pickups without progressing the task
 
-**MAPPO (Centralized Critic)** is now available via `--algo mappo` as a strong CTDE baseline. It adds the following per-episode CSV fields beyond the standard IPPO ones:
+**MAPPO (Centralized Critic)** is available via `--algo mappo` as a strong CTDE baseline. The key comparison is **IPPO-egocentric vs MAPPO-egocentric** — both use the same 520-dim actor input, so MAPPO's advantage comes purely from its centralized critic (1040-dim global state). Additional CSV fields beyond IPPO:
 
 | Field | Description |
 |-------|-------------|
 | `critic_loss` | Centralized critic MSE loss |
 | `value_mean` | Mean V(s) across episode timesteps |
 | `advantage_mean` | Mean GAE advantage (before normalization) |
+
+Summary JSON also records `obs_mode`, `actor_obs_dim`, and `global_obs_dim` for each run.
 
 MAPPO serves as a comparison point for future teammate-aware methods (LOLA, Lookahead) — if MAPPO's centralized critic substantially outperforms IPPO, it suggests value estimation (not policy optimization) is the bottleneck in this cooperative task.
 

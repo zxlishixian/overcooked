@@ -72,6 +72,9 @@ def main():
     parser.add_argument('--ppo_epochs', type=int, default=4)
     parser.add_argument('--algo', default='ippo', choices=['ippo', 'mappo'],
                         help='Algorithm: ippo (independent PPO) or mappo (centralized-critic MAPPO)')
+    parser.add_argument('--obs_mode', default='egocentric',
+                        choices=['egocentric', 'global_concat', 'local'],
+                        help='Observation mode')
     args = parser.parse_args()
 
     parts = args.pairs.split(',')
@@ -106,6 +109,7 @@ def main():
             ppo_epochs=args.ppo_epochs,
             device=gpu_id if gpu_id is not None else 'auto',
             algo=args.algo,
+            obs_mode=args.obs_mode,
         )
         summary['agent0_type'] = agent0_type
         summary['agent1_type'] = agent1_type

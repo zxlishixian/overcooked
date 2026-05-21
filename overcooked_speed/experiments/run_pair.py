@@ -61,11 +61,13 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
              reward_threshold=20.0, spec_threshold=0.3,
              min_delivery_events=1, min_cooking_events=3,
              reward_shaping=True, ent_coef=0.05, ppo_epochs=4,
-             device='auto', algo='ippo'):
+             device='auto', algo='ippo', obs_mode='egocentric'):
     """Run one agent pair for num_episodes and log results.
 
     Args:
         algo: 'ippo' (independent PPO) or 'mappo' (centralized-critic MAPPO).
+        obs_mode: 'egocentric' (agent-specific ~520-dim) or 'global_concat'
+                  (both agents see same ~1040-dim).
     """
 
     np.random.seed(seed)
@@ -82,17 +84,24 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
 
     print(f"Using device: {torch_device} (GPU {used_gpu})" if used_gpu >= 0
           else f"Using device: {torch_device}")
-    print(f"Algorithm: {algo.upper()}")
+    print(f"Algorithm: {algo.upper()}  obs_mode: {obs_mode}")
 
     env = OvercookedWrapper(layout_name=layout, horizon=horizon,
-                            reward_shaping=reward_shaping)
-    obs_dim = env.obs_dim
+                            reward_shaping=reward_shaping, obs_mode=obs_mode)
+    # Auto-detect dimensions from env (no hardcoding)
+    obs0, obs1 = env.reset()
+    obs_dim = obs0.shape[0]
+    global_obs_dim = env.global_obs_dim
     n_actions = env.NUM_ACTIONS
+
+    print(f"actor_obs_dim={obs_dim}  global_obs_dim={global_obs_dim}")
 
     if algo == 'mappo':
         mappo = MAPPOManager(obs_dim, n_actions, lr=lr, gamma=gamma,
                              hidden_dim=hidden_dim, device=torch_device,
-                             ppo_epochs=ppo_epochs, ent_coef=ent_coef)
+                             ppo_epochs=ppo_epochs, ent_coef=ent_coef,
+                             global_obs_dim=global_obs_dim)
+        print(f"MAPPO: actor input={obs_dim}, critic input={global_obs_dim}")
     else:
         agent0 = create_agent(agent0_type, 0, obs_dim, n_actions, lr, gamma, hidden_dim,
                               device=torch_device, ent_coef=ent_coef,
@@ -152,7 +161,8 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
 
         while not done:
             if algo == 'mappo':
-                a0, a1 = mappo.act(obs0, obs1)
+                global_obs = env.get_global_obs()
+                a0, a1 = mappo.act(obs0, obs1, global_obs)
             else:
                 a0 = agent0.act(obs0)
                 a1 = agent1.act(obs1)
@@ -283,6 +293,10 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
         'layout': layout,
         'agent0_type': agent0_type,
         'agent1_type': agent1_type,
+        'algo': algo,
+        'obs_mode': obs_mode,
+        'actor_obs_dim': obs_dim,
+        'global_obs_dim': global_obs_dim,
         'num_episodes': num_episodes,
         'horizon': horizon,
         'time_elapsed': time.time() - t_start,
@@ -337,6 +351,11 @@ def main():
                         help='PPO update epochs per episode (default 4)')
     parser.add_argument('--algo', default='ippo', choices=['ippo', 'mappo'],
                         help='Algorithm: ippo (independent PPO) or mappo (centralized-critic MAPPO)')
+    parser.add_argument('--obs_mode', default='egocentric',
+                        choices=['egocentric', 'global_concat', 'local'],
+                        help='Observation mode: egocentric (~520-dim per agent), '
+                             'global_concat (~1040-dim both agents), '
+                             'local (reserved for future)')
     args = parser.parse_args()
 
     gpu_id = None
@@ -364,6 +383,7 @@ def main():
         ppo_epochs=args.ppo_epochs,
         device=gpu_id if gpu_id is not None else 'auto',
         algo=args.algo,
+        obs_mode=args.obs_mode,
     )
 
 

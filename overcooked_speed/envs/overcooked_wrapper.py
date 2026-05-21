@@ -18,7 +18,11 @@ class OvercookedWrapper:
     ACTION_NAMES = ['up', 'down', 'right', 'left', 'stay', 'interact']
 
     def __init__(self, layout_name='cramped_room', horizon=400,
-                 reward_shaping=False):
+                 reward_shaping=False, obs_mode='egocentric'):
+        if obs_mode not in ('egocentric', 'global_concat', 'local'):
+            raise ValueError(
+                f"Unknown obs_mode '{obs_mode}'. "
+                f"Supported: egocentric, global_concat, local")
         is_custom, spec = get_layout_spec(layout_name)
         if is_custom:
             mdp = OvercookedGridworld.from_grid(spec['grid'], base_layout_params={
@@ -34,6 +38,7 @@ class OvercookedWrapper:
         self.horizon = horizon
         self.num_players = 2
         self.reward_shaping = reward_shaping
+        self.obs_mode = obs_mode
 
         # Track held objects + game_stats deltas for reward shaping
         self._prev_held = {0: None, 1: None}
@@ -97,6 +102,30 @@ class OvercookedWrapper:
         return shaping
 
     def get_obs(self, agent_id):
+        """Return agent-centric observation based on obs_mode.
+
+        egocentric:   enc[agent_id].flatten()  — agent-specific ~520-dim
+        global_concat: np.array(enc).flatten() — both agents see same ~1040-dim
+        local:        reserved for future partial-observation work
+        """
+        enc = self._env.lossless_state_encoding_mdp(self._env.state)
+        if self.obs_mode == "egocentric":
+            return np.array(enc[agent_id], dtype=np.float32).flatten()
+        elif self.obs_mode == "global_concat":
+            return np.array(enc, dtype=np.float32).flatten()
+        elif self.obs_mode == "local":
+            raise NotImplementedError(
+                "local observation mode is reserved for future work")
+        else:
+            raise ValueError(f"Unknown obs_mode: {self.obs_mode}")
+
+    def get_global_obs(self):
+        """Full global state encoding for centralized critic (MAPPO).
+
+        Always returns the concatenated dual-perspective encoding regardless of
+        obs_mode — this ensures the centralized critic sees the full state even
+        when actors are limited to egocentric views.
+        """
         enc = self._env.lossless_state_encoding_mdp(self._env.state)
         return np.array(enc, dtype=np.float32).flatten()
 
@@ -119,9 +148,19 @@ class OvercookedWrapper:
 
     @property
     def obs_dim(self):
+        """Actor observation dimension for the current obs_mode."""
+        s = self._env.state
+        if s is None:
+            self._env.reset()
+            s = self._env.state
+        return self.get_obs(0).shape[0]
+
+    @property
+    def global_obs_dim(self):
+        """Full global state dimension (always concatenated, for MAPPO critic)."""
         s = self._env.state
         if s is None:
             self._env.reset()
             s = self._env.state
         enc = self._env.lossless_state_encoding_mdp(s)
-        return len(np.array(enc).flatten())
+        return len(np.array(enc, dtype=np.float32).flatten())

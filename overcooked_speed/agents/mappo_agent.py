@@ -50,7 +50,7 @@ class MAPPOManager:
                  hidden_dim=256, device='cpu',
                  ppo_epochs=4, ppo_clip=0.2, gae_lambda=0.95,
                  vf_coef=0.5, ent_coef=0.05, max_grad_norm=0.5,
-                 critic_lr=None):
+                 critic_lr=None, global_obs_dim=None):
         self.n_actions = n_actions
         self.gamma = gamma
         self.device = device
@@ -61,12 +61,15 @@ class MAPPOManager:
         self.ent_coef = ent_coef
         self.max_grad_norm = max_grad_norm
 
-        # Two decentralized actors
+        if global_obs_dim is None:
+            global_obs_dim = obs_dim
+
+        # Two decentralized actors — each sees only its own egocentric/local obs
         self.actor0 = ActorCritic(obs_dim, hidden_dim, n_actions, device=device)
         self.actor1 = ActorCritic(obs_dim, hidden_dim, n_actions, device=device)
 
-        # One centralized critic
-        self.critic = CentralizedCritic(obs_dim, hidden_dim, device=device)
+        # One centralized critic — sees full global state
+        self.critic = CentralizedCritic(global_obs_dim, hidden_dim, device=device)
 
         # Separate optimizers
         critic_lr = critic_lr if critic_lr is not None else lr
@@ -76,6 +79,7 @@ class MAPPOManager:
 
         # Per-agent episode buffers (actions, log_probs, observations)
         self._obs0, self._obs1 = [], []
+        self._global_obs = []
         self._actions0, self._actions1 = [], []
         self._log_probs0, self._log_probs1 = [], []
         self._rewards = []
@@ -91,13 +95,19 @@ class MAPPOManager:
         self.actor1.eval()
         self.critic.eval()
 
-    def act(self, obs0, obs1, deterministic=False):
-        """Both actors sample actions independently. Returns (a0, a1)."""
+    def act(self, obs0, obs1, global_obs, deterministic=False):
+        """Both actors sample actions independently. Returns (a0, a1).
+
+        Args:
+            obs0, obs1: actor-specific observations (controlled by obs_mode)
+            global_obs: full global state for centralized critic V(s)
+        """
         a0, lp0, _ = self.actor0.act(obs0, deterministic)
         a1, lp1, _ = self.actor1.act(obs1, deterministic)
 
         self._obs0.append(obs0)
         self._obs1.append(obs1)
+        self._global_obs.append(global_obs)
         self._actions0.append(a0)
         self._actions1.append(a1)
         self._log_probs0.append(lp0)
@@ -119,11 +129,11 @@ class MAPPOManager:
         self._dones[-1] = True
 
         # ── Compute centralized critic values for all states ──
-        # Use a single obs (either agent's, since both see the same global state)
-        obs_t = torch.as_tensor(np.stack(self._obs0), dtype=torch.float32,
-                                device=self.device)
+        # Critic uses full global state, which may differ from actor obs
+        global_t = torch.as_tensor(np.stack(self._global_obs), dtype=torch.float32,
+                                   device=self.device)
         with torch.no_grad():
-            critic_values = self.critic(obs_t).cpu().numpy()
+            critic_values = self.critic(global_t).cpu().numpy()
 
         # ── Compute GAE advantages (shared by both actors) ──
         advantages, returns = self._compute_gae(
@@ -138,6 +148,10 @@ class MAPPOManager:
         advantages_t = torch.as_tensor(advantages, dtype=torch.float32, device=self.device)
         returns_t = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
 
+        # Each actor uses its own egocentric observations
+        obs0_t = torch.as_tensor(np.stack(self._obs0), dtype=torch.float32, device=self.device)
+        obs1_t = torch.as_tensor(np.stack(self._obs1), dtype=torch.float32, device=self.device)
+
         actions0_t = torch.as_tensor(self._actions0, dtype=torch.int64, device=self.device)
         actions1_t = torch.as_tensor(self._actions1, dtype=torch.int64, device=self.device)
         old_lp0_t = torch.as_tensor(self._log_probs0, dtype=torch.float32, device=self.device)
@@ -145,15 +159,15 @@ class MAPPOManager:
 
         # ── Update both actors with PPO ──
         actor0_log = self._update_actor(
-            self.actor0, self.actor0_opt, obs_t, actions0_t,
+            self.actor0, self.actor0_opt, obs0_t, actions0_t,
             old_lp0_t, advantages_t)
 
         actor1_log = self._update_actor(
-            self.actor1, self.actor1_opt, obs_t, actions1_t,
+            self.actor1, self.actor1_opt, obs1_t, actions1_t,
             old_lp1_t, advantages_t)
 
-        # ── Update centralized critic ──
-        critic_log = self._update_critic(obs_t, returns_t)
+        # ── Update centralized critic with global state ──
+        critic_log = self._update_critic(global_t, returns_t)
 
         self._clear_buffers()
 
@@ -277,6 +291,7 @@ class MAPPOManager:
 
     def _clear_buffers(self):
         self._obs0, self._obs1 = [], []
+        self._global_obs = []
         self._actions0, self._actions1 = [], []
         self._log_probs0, self._log_probs1 = [], []
         self._rewards = []
