@@ -97,31 +97,37 @@ The shaping uses MDP-verified game stats to prevent reward exploitation — earl
 - **Critic update**: MSE regression on returns, independent optimizer
 - **Key difference from IPPO**: Rather than each agent learning its own value function from its own perspective, MAPPO uses a single centralized critic that sees the full global state — this stabilizes value estimation in cooperative tasks where individual observations are partial or noisy
 
-### Role Shaping (IPPO only) — `--role_shaping`
+### Unified Shaping API — `--shaping_type`
 
-A simple, interpretable, role-level LOLA-like method that encourages complementary role specialization **without second-order gradients or neural teammate models**. Applied only to IPPO; MAPPO already captures role dynamics via its centralized critic.
+A general-purpose mechanism diagnosis API that supports 10 shaping types for understanding *why* role shaping works (or doesn't). All types inject a per-episode bonus via `add_terminal_bonus()`, propagated backward through the trajectory by GAE.
 
-**How it works:**
+**Architecture**: A single `RoleShapingManager` class in [role_shaping.py](overcooked_speed/agents/role_shaping.py) dispatches via `_compute_raw()` based on `shaping_type`. Methods that use teammate role history (`_ROLE_TYPES`) call `record_episode()` to maintain a sliding window of past episode counts. Diagnostic methods compute the bonus purely from the current episode's event counts.
 
-1. **Track teammate role tendency from recent history**: For the past K episodes, count each agent's cooking events (onion pickup + pot placement) and delivery events (dish pickup + soup pickup + delivery). Compute `p_teammate_cook` and `p_teammate_deliver` — the teammate's probability of cooking vs delivering.
+**Shaping types:**
 
-2. **Reward complementary behavior**: At the end of each episode, compute a role bonus:
-   ```
-   bonus_i = p_teammate_cook × delivery_event_i + p_teammate_deliver × cooking_event_i
-   ```
-   If the teammate tends to cook (high `p_cook`), agent i is rewarded for delivering (complementary). If the teammate tends to deliver, agent i is rewarded for cooking.
+| `--shaping_type` | Mechanism tested | Uses teammate history | Bonus formula |
+|------------------|------------------|----------------------|---------------|
+| `none` | No shaping (baseline) | — | 0 |
+| `raw_clipped` | Role complementarity (original) | Yes (K=20) | `p_cook×delivery + p_deliver×cooking` |
+| `normalized` | Event-normalized complementarity | Yes (K=20) | `(p_cook×delivery + p_deliver×cooking) / total_events` |
+| `weighted_normalized` | Weighted complementarity | Yes (K=20) | Weighted by event importance (delivery=1.0, potting=1.0, pickup=0.2) |
+| `delta_complementarity` | Complementarity improvement over baseline | Yes (K=20) | `C_current − mean(C_history)` |
+| `constant_bonus` | Constant reward shift | No | 1.0 |
+| `event_density_bonus` | Task-progress density | No | `useful_events / total_actions` |
+| `event_binary_bonus` | Simple event-occurrence signal | No | 1.0 if any useful event occurred |
+| `delivery_chain_bonus` | Weighted task-progress (normalized) | No | `weighted_chain / total_actions` |
+| `delivery_chain_raw_clipped` | Weighted task-progress (raw, clipped) | No | `weighted_chain` (clipped to ±bonus_clip) |
 
-3. **No future leakage**: Teammate tendency for episode t uses only episodes [t-K, t-1]. Early episodes (before K episodes are collected) use a neutral prior (0.5, 0.5).
-
-4. **Bonus injected via GAE**: The shaped bonus is added to the last step's reward via `add_terminal_bonus()`, so GAE propagates it backward through the episode — rewarding all actions that led to complementary behavior.
-
-**Key design choices:**
+**Key design decisions:**
 | Choice | Rationale |
 |--------|-----------|
 | Window K=20 | Smooths noise, adapts to role drift |
-| λ_role=0.1 | Small bonus relative to env reward (~20) — nudges without dominating |
-| Bonus clip ±1.0 | Prevents extreme bonuses from destabilizing PPO |
+| Bonus clip ±1.0 (default) | Prevents extreme bonuses from destabilizing PPO |
+| λ_role scales bonus before GAE injection | Allows tuning of shaping strength vs environment reward |
 | IPPO only | MAPPO's centralized critic already captures role dynamics |
+| Diagnostic types don't use teammate history | Isolates the mechanism — any improvement comes from the signal itself, not from tracking teammate behavior |
+
+**Backward compatibility**: `--role_shaping`, `--role_bonus_type`, and `--role_bonus_clip` are preserved as deprecated aliases that map to `--shaping_type` and `--bonus_clip`.
 
 ### Observation Space
 
@@ -177,9 +183,16 @@ python overcooked_speed/experiments/run_pair.py \
 # IPPO + Role Shaping (teammate-aware complementary reward)
 python overcooked_speed/experiments/run_pair.py \
     --layout cramped_room --algo ippo --obs_mode egocentric \
-    --role_shaping --lambda_role 0.1 --role_window 20 \
+    --shaping_type raw_clipped --lambda_role 0.1 --role_window 20 \
     --agent0 nl --agent1 nl \
     --num_episodes 100 --seed 0 --log_dir logs/demo_role
+
+# IPPO + Diagnostic shaping (e.g., event density bonus)
+python overcooked_speed/experiments/run_pair.py \
+    --layout cramped_room --algo ippo --obs_mode egocentric \
+    --shaping_type event_density_bonus --lambda_role 0.03 \
+    --agent0 nl --agent1 nl \
+    --num_episodes 100 --seed 0 --log_dir logs/demo_density
 
 # Multi-seed sweep (500 episodes × 3 seeds, GPU auto-detect)
 python overcooked_speed/experiments/sweep_pairs.py \
@@ -210,10 +223,13 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 | `--ppo_epochs` | 4 | PPO update epochs per episode |
 | `--algo` | `ippo` | Algorithm: `ippo` (independent PPO) or `mappo` (centralized-critic MAPPO) |
 | `--obs_mode` | `egocentric` | Observation mode: `egocentric` (~520-dim), `global_concat` (~1040-dim), `local` (reserved) |
-| `--role_shaping` | `False` | Enable role-level LOLA-like reward shaping (IPPO only) |
-| `--role_window` | 20 | Past episodes for teammate role tendency estimation |
-| `--lambda_role` | 0.1 | Role bonus weight in training reward |
-| `--role_bonus_clip` | 1.0 | Max absolute role bonus per episode |
+| `--shaping_type` | `none` | Shaping bonus type: `none`, `raw_clipped`, `normalized`, `weighted_normalized`, `delta_complementarity`, `constant_bonus`, `event_density_bonus`, `event_binary_bonus`, `delivery_chain_bonus`, `delivery_chain_raw_clipped` |
+| `--bonus_clip` | 1.0 | Max absolute bonus per episode (applied after bonus_type raw compute) |
+| `--lambda_role` | 0.1 | Shaping bonus weight in training reward |
+| `--role_window` | 20 | Past episodes for teammate role tendency (role-based types only) |
+| `--role_shaping` | `False` | ⚠️ Deprecated — use `--shaping_type raw_clipped` |
+| `--role_bonus_type` | — | ⚠️ Deprecated — use `--shaping_type` |
+| `--role_bonus_clip` | — | ⚠️ Deprecated — use `--bonus_clip` |
 | `--log_dir` | `logs/smoke` | Output directory for CSVs and summary JSON |
 
 `sweep_pairs.py` adds:
@@ -224,10 +240,11 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 | `--seeds` | `0 1 2` | Random seeds for multi-seed averaging |
 | `--algo` | `ippo` | Algorithm: `ippo` or `mappo` |
 | `--obs_mode` | `egocentric` | Observation mode: `egocentric`, `global_concat`, `local` |
-| `--role_shaping` | `False` | Enable role shaping (IPPO only, ignored for MAPPO) |
+| `--shaping_type` | `none` | Shaping bonus type (same 10 options as run_pair) |
+| `--bonus_clip` | 1.0 | Max absolute bonus per episode |
+| `--lambda_role` | 0.1 | Shaping bonus weight |
 | `--role_window` | 20 | Past episodes for teammate tendency |
-| `--lambda_role` | 0.1 | Role bonus weight |
-| `--role_bonus_clip` | 1.0 | Max absolute role bonus |
+| `--role_shaping` | `False` | ⚠️ Deprecated — use `--shaping_type raw_clipped` |
 
 ## Key Findings
 
@@ -270,6 +287,59 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 6. **Current limitation — bonus saturation**: With `bonus_clip=1.0`, the raw role bonus (p_cook × deliveries + p_deliver × cooking) routinely exceeds 1.0 in a 400-step episode (15-20+ events), so the bonus clips to 1.0 almost every episode. This turns `lambda_role * bonus = 0.1` into a constant shift rather than a behavior-sensitive gradient. Future work: increase clip, normalize by episode steps, or use ranking-based bonus
 7. **Reward shaping anti-exploitation**: using `game_stats['potting_onion']` delta (MDP-verified) prevents the reward hacking seen in earlier versions where agents spammed onion pickups without progressing the task
 
+### Mechanism Diagnosis: Why Does Role Shaping Help? (300ep × 3 seeds)
+
+To disentangle *which* component of `raw_clipped` role shaping drives the improvement, we ran a controlled ablation comparing 5 diagnostic shaping types, each at 2 bonus weights (λ=0.03, 0.1), all with the same PPO hyperparameters:
+
+| Config | λ=0.03 | λ=0.1 | Clip rate |
+|--------|--------|-------|-----------|
+| **IPPO-ego baseline** (500ep) | — | **29.6 ± 6.8** | — |
+| **raw_clipped** role shaping (500ep) | — | **45.3 ± 18.9** | ~100% |
+| `constant_bonus` | 18.7 ± 1.8 | 22.9 ± 5.0 | 0% |
+| `event_binary_bonus` | 18.7 ± 1.8 | 22.9 ± 5.0 | 0% |
+| `event_density_bonus` | **27.1 ± 6.2** | 20.5 ± 4.7 | 0% |
+| `delivery_chain_bonus` | 14.9 ± 4.1 | 20.6 ± 0.6 | 0% |
+| `delivery_chain_raw_clipped` | 22.7 ± 5.9 | 18.2 ± 4.2 | ~97% |
+
+**Five diagnostic questions answered:**
+
+1. **Does constant_bonus reproduce raw_clipped improvement?** No. At λ=0.1, constant_bonus achieves 22.9 vs raw_clipped 45.3. A constant +0.1 reward shift per episode does not explain the 53% gain — the signal must carry behavior-relevant information.
+
+2. **Is event_density better than constant?** Yes, at low λ (27.1 vs 18.7). Density bonus = `useful_events / total_actions` carries information about action efficiency, which constant_bonus cannot. However, at higher λ (0.1), density drops to 20.5, suggesting the signal becomes too noisy when amplified.
+
+3. **Does delivery_chain beat role complementarity?** No. Neither chain variant (normalized or raw_clipped) reaches the IPPO-ego baseline (29.6), let alone raw_clipped role shaping (45.3). The weighted task-progress signal alone is insufficient.
+
+4. **What signals correlate with reward?** Correlation analysis across all existing logs (10,000+ episodes) reveals that **task-progress event counts**, not role complementarity, are the strongest reward predictors:
+
+| Signal | Pearson r | Spearman ρ |
+|--------|-----------|-------------|
+| `total_potting` (onions placed in pots) | **+0.813** | **+0.963** |
+| `total_task_events` | +0.728 | +0.755 |
+| `total_soup_delivery` | +0.698 | +0.711 |
+| `mean_role_bonus_raw` | +0.334 | +0.504 |
+| `complementarity_current` | +0.356 | +0.512 |
+| `complementarity_delta` | +0.160 | +0.242 |
+
+The Spearman correlation is even stronger for total_potting (ρ=0.963) — the *rank ordering* of episodes by potting events almost perfectly predicts reward ranking. This is expected in Overcooked where soup delivery requires 3 onions per pot.
+
+5. **What does this mean?** The evidence points to **task-progress density during early training** as the mechanism, not pure constant shift or role complementarity. However, `event_density_bonus` alone (27.1) does not match `raw_clipped` (45.3), suggesting that **combining** task-progress signals with teammate-history-aware role complementarity produces a synergistic effect that neither component achieves alone.
+
+**Caveats**: Diagnostic sweep was 300ep × 3 seeds; baseline comparisons are against 500ep × 5 seeds. Results may not be directly comparable at the same episode count.
+
+### Correlation Analysis Tool
+
+```bash
+# Compute Pearson & Spearman correlation between shaping signals and reward
+python overcooked_speed/analysis/analyze_shaping_signal.py \
+    --log_dirs logs/ippo_role_shaping_ego_500 logs/ablation/normalized_l003 \
+    --output_csv logs/correlation_summary.csv
+```
+
+The script reads all episode CSVs recursively, computes derived signals (total_cooking, total_delivery, total_task_events, etc.), and reports three correlation types:
+- **same_episode**: corr(signal_t, reward_t)
+- **next_episode**: corr(signal_t, reward_{t+1}) — predictive power
+- **moving_avg_10**: corr(signal_t, MA_reward_{t:t+10}) — smoothed reward
+
 **MAPPO CSV fields** (beyond IPPO):
 
 | Field | Description |
@@ -278,14 +348,26 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 | `value_mean` | Mean V(s) across episode timesteps |
 | `advantage_mean` | Mean GAE advantage (before normalization) |
 
-**Role shaping CSV fields** (beyond IPPO):
+**Shaping CSV fields** (beyond IPPO):
 
 | Field | Description |
 |-------|-------------|
-| `a0_role_bonus` / `a1_role_bonus` | Raw role bonus per agent (before λ_role scaling) |
-| `a0_shaped_reward` / `a1_shaped_reward` | Episode reward + λ_role × role_bonus |
+| `shaping_type` | Active shaping type string |
+| `lambda_role` | Shaping bonus weight |
+| `bonus_clip` | Max absolute applied bonus |
+| `agent0_shaping_raw` / `agent1_shaping_raw` | Raw bonus per agent (before clip) |
+| `agent0_shaping_applied` / `agent1_shaping_applied` | Applied bonus per agent (after clip) |
+| `mean_shaping_applied` | Mean applied bonus across both agents |
+| `shaping_clip_rate` | Fraction of episodes where raw ≠ applied |
+| `a0_shaped_reward` / `a1_shaped_reward` | Episode reward + λ_role × applied_bonus |
 | `teammate0_p_cook` / `teammate0_p_deliver` | Agent 0's teammate (agent 1) role tendency |
 | `teammate1_p_cook` / `teammate1_p_deliver` | Agent 1's teammate (agent 0) role tendency |
+| `complementarity_current` | Current episode complementarity C |
+| `complementarity_delta` | C_current − mean(C_history) |
+| `total_task_events` | Sum of cooking + delivery events |
+| `total_potting` | Total onions placed in pots |
+| `total_soup_pickup` | Total soups picked up |
+| `total_soup_delivery` | Total soups delivered |
 
 ### Reward Shaping Evolution
 
@@ -319,6 +401,7 @@ overcooked/
 │   │   └── __init__.py               # GPU detection, custom layout registry
 │   ├── analysis/
 │   │   ├── metrics.py                # Convergence & specialization metrics
+│   │   ├── analyze_shaping_signal.py # Correlation: shaping signals vs reward
 │   │   ├── plot_learning_curves.py   # Reward/spec/action/learning curves
 │   │   └── plot_heatmap.py           # Bar/heatmap across algorithm pairs
 │   ├── experiments/

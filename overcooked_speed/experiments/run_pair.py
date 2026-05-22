@@ -63,17 +63,21 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
              reward_shaping=True, ent_coef=0.05, ppo_epochs=4,
              device='auto', algo='ippo', obs_mode='egocentric',
              role_shaping=False, role_window=20, lambda_role=0.1,
-             role_bonus_clip=1.0):
+             role_bonus_clip=1.0, role_bonus_type='raw_clipped',
+             shaping_type='none', bonus_clip=1.0):
     """Run one agent pair for num_episodes and log results.
 
     Args:
         algo: 'ippo' (independent PPO) or 'mappo' (centralized-critic MAPPO).
         obs_mode: 'egocentric' (agent-specific ~520-dim) or 'global_concat'
                   (both agents see same ~1040-dim).
-        role_shaping: enable role-level LOLA-like reward shaping (IPPO only).
-        role_window: number of past episodes to estimate teammate role tendency.
-        lambda_role: weight of role bonus in training reward.
-        role_bonus_clip: max absolute role bonus per episode.
+        shaping_type: 'none', 'raw_clipped', 'constant_bonus',
+            'event_density_bonus', 'event_binary_bonus',
+            'delivery_chain_bonus', 'delivery_chain_raw_clipped',
+            'normalized', 'weighted_normalized', 'delta_complementarity'.
+        lambda_role: weight of shaping bonus in training reward.
+        bonus_clip: max absolute applied bonus per episode.
+        role_shaping, role_bonus_type, role_bonus_clip: deprecated aliases.
     """
 
     np.random.seed(seed)
@@ -102,15 +106,22 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
 
     print(f"actor_obs_dim={obs_dim}  global_obs_dim={global_obs_dim}")
 
-    if role_shaping and algo == 'mappo':
+    # Resolve effective shaping_type (backward compat with role_shaping / role_bonus_type)
+    effective_type = shaping_type
+    if role_shaping and effective_type == 'none':
+        effective_type = role_bonus_type if role_bonus_type else 'raw_clipped'
+
+    if effective_type != 'none' and algo == 'mappo':
         raise NotImplementedError(
-            "Role shaping is currently only supported for IPPO (--algo ippo). "
+            "Shaping is currently only supported for IPPO (--algo ippo). "
             "MAPPO already uses a centralized critic which captures role dynamics.")
 
-    if role_shaping:
-        print(f"Role shaping enabled: window={role_window} "
-              f"lambda={lambda_role} clip={role_bonus_clip}")
-        role_mgr = RoleShapingManager(window=role_window, bonus_clip=role_bonus_clip)
+    if effective_type != 'none':
+        print(f"Shaping enabled: type={effective_type} "
+              f"window={role_window} lambda={lambda_role} clip={bonus_clip}")
+        role_mgr = RoleShapingManager(window=role_window, bonus_clip=bonus_clip,
+                                       shaping_type=effective_type,
+                                       lambda_role=lambda_role)
 
     if algo == 'mappo':
         mappo = MAPPOManager(obs_dim, n_actions, lr=lr, gamma=gamma,
@@ -146,18 +157,27 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
                     'a0_approx_kl', 'a1_approx_kl',
                     'a0_value_loss', 'a1_value_loss']
     mappo_extra = ['critic_loss', 'value_mean', 'advantage_mean']
-    role_fields = ['a0_role_bonus', 'a1_role_bonus',
-                   'a0_shaped_reward', 'a1_shaped_reward',
-                   'teammate0_p_cook', 'teammate0_p_deliver',
-                   'teammate1_p_cook', 'teammate1_p_deliver']
+    shaping_fields = [
+        'shaping_type', 'lambda_role', 'bonus_clip',
+        'agent0_shaping_raw', 'agent1_shaping_raw',
+        'agent0_shaping_applied', 'agent1_shaping_applied',
+        'mean_shaping_applied', 'shaping_clip_rate',
+        'a0_shaped_reward', 'a1_shaped_reward',
+        'total_task_events', 'total_potting', 'total_soup_pickup',
+        'total_soup_delivery',
+        # Role-specific (populated only for role types)
+        'teammate0_p_cook', 'teammate0_p_deliver',
+        'teammate1_p_cook', 'teammate1_p_deliver',
+        'complementarity_current', 'complementarity_delta',
+    ]
     spec_fields = ['s_delivery', 's_cooking', 's_overall',
                    's_delivery_gated', 's_cooking_gated', 's_overall_gated']
 
     extra = []
     if algo == 'mappo':
         extra += mappo_extra
-    if role_shaping:
-        extra += role_fields
+    if effective_type != 'none':
+        extra += shaping_fields
 
     fieldnames = (base_fields + a0_event_fields + a1_event_fields +
                   a0_action_fields + a1_action_fields +
@@ -212,30 +232,58 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
         counts = tracker.get_all_counts()
         episode_event_counts.append(counts)
 
-        # ── Role shaping (IPPO only, prior to training) ──
-        role_bonus0 = 0.0
-        role_bonus1 = 0.0
-        p_cook_0 = 0.5
-        p_deliver_0 = 0.5
-        p_cook_1 = 0.5
-        p_deliver_1 = 0.5
+        # ── Shaping (IPPO only, episode-level, prior to training) ──
+        s_raw0 = s_raw1 = 0.0
+        s_app0 = s_app1 = 0.0
+        s_clipped = False
+        p_cook_0 = p_deliver_0 = 0.5
+        p_cook_1 = p_deliver_1 = 0.5
+        comp_current = 0.5
+        comp_delta = 0.0
+        total_task_events = 0.0
+        total_potting = 0.0
+        total_soup_pickup = 0.0
+        total_soup_delivery = 0.0
 
-        if role_shaping:
-            # Compute role bonuses from this episode's events,
-            # weighted by teammate tendency from *previous* episodes
-            role_bonus0 = role_mgr.compute_role_bonus(0, counts[0])
-            role_bonus1 = role_mgr.compute_role_bonus(1, counts[1])
-            p_cook_0, p_deliver_0 = role_mgr.get_teammate_tendency(0)
-            p_cook_1, p_deliver_1 = role_mgr.get_teammate_tendency(1)
+        if effective_type != 'none':
+            # Pre-compute aggregate event counts
+            total_potting = (counts[0].get('place_onion_in_pot', 0) +
+                           counts[1].get('place_onion_in_pot', 0))
+            total_soup_pickup = (counts[0].get('pickup_soup', 0) +
+                                counts[1].get('pickup_soup', 0))
+            total_soup_delivery = (counts[0].get('deliver_soup', 0) +
+                                  counts[1].get('deliver_soup', 0))
+            total_task_events = (
+                counts[0].get('pickup_onion', 0) + counts[1].get('pickup_onion', 0) +
+                total_potting +
+                counts[0].get('pickup_dish', 0) + counts[1].get('pickup_dish', 0) +
+                total_soup_pickup +
+                total_soup_delivery)
 
-            shaped0 = lambda_role * role_bonus0
-            shaped1 = lambda_role * role_bonus1
+            # For delta type: set both agents' counts before computing bonus
+            if effective_type == 'delta_complementarity':
+                role_mgr.set_delta_counts(counts[0], counts[1])
+
+            s_raw0, s_app0 = role_mgr.compute_bonus(0, counts[0])
+            s_raw1, s_app1 = role_mgr.compute_bonus(1, counts[1])
+            s_clipped = (abs(s_raw0 - s_app0) > 1e-8 or
+                        abs(s_raw1 - s_app1) > 1e-8)
+
+            # For role types: get teammate tendencies and complementarity
+            if role_mgr.is_role_type:
+                p_cook_0, p_deliver_0 = role_mgr.get_teammate_tendency(0)
+                p_cook_1, p_deliver_1 = role_mgr.get_teammate_tendency(1)
+                if effective_type == 'delta_complementarity':
+                    comp_current = role_mgr.get_complementarity(counts[0], counts[1])
+                    comp_delta = s_app0  # same for both agents
+
+            shaped0 = lambda_role * s_app0
+            shaped1 = lambda_role * s_app1
             agent0.add_terminal_bonus(float(shaped0))
             agent1.add_terminal_bonus(float(shaped1))
             ep_reward_shaped0 = ep_reward + float(shaped0)
             ep_reward_shaped1 = ep_reward + float(shaped1)
 
-            # Record for next episode's tendency estimation
             role_mgr.record_episode(counts[0], counts[1])
 
         # End-of-episode training
@@ -333,15 +381,29 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
             row['critic_loss'] = log.get('critic_loss', 0)
             row['value_mean'] = log.get('value_mean', 0)
             row['advantage_mean'] = log.get('advantage_mean', 0)
-        if role_shaping:
-            row['a0_role_bonus'] = role_bonus0
-            row['a1_role_bonus'] = role_bonus1
+        if effective_type != 'none':
+            row['shaping_type'] = effective_type
+            row['lambda_role'] = lambda_role
+            row['bonus_clip'] = bonus_clip
+            row['agent0_shaping_raw'] = s_raw0
+            row['agent1_shaping_raw'] = s_raw1
+            row['agent0_shaping_applied'] = s_app0
+            row['agent1_shaping_applied'] = s_app1
+            row['mean_shaping_applied'] = (s_app0 + s_app1) / 2.0
+            row['shaping_clip_rate'] = 1.0 if s_clipped else 0.0
             row['a0_shaped_reward'] = ep_reward_shaped0
             row['a1_shaped_reward'] = ep_reward_shaped1
+            row['total_task_events'] = total_task_events
+            row['total_potting'] = total_potting
+            row['total_soup_pickup'] = total_soup_pickup
+            row['total_soup_delivery'] = total_soup_delivery
+            # Role-specific fields (only for role types)
             row['teammate0_p_cook'] = p_cook_0
             row['teammate0_p_deliver'] = p_deliver_0
             row['teammate1_p_cook'] = p_cook_1
             row['teammate1_p_deliver'] = p_deliver_1
+            row['complementarity_current'] = comp_current
+            row['complementarity_delta'] = comp_delta
         writer.writerow(row)
 
     csv_file.close()
@@ -365,10 +427,34 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
         'min_cooking_events': min_cooking_events,
         'role_shaping': role_shaping,
     })
-    if role_shaping:
+    if effective_type != 'none':
+        # Read back CSV to compute aggregate shaping stats
+        import csv as csv_module
+        csv_path = os.path.join(log_dir, 'episodes.csv')
+        all_applied = []
+        all_clip_rate_vals = []
+        all_task_events = []
+        all_soup_del = []
+        with open(csv_path, 'r') as f:
+            reader = csv_module.DictReader(f)
+            for row in reader:
+                if row.get('mean_shaping_applied'):
+                    all_applied.append(abs(float(row['mean_shaping_applied'])))
+                if row.get('shaping_clip_rate'):
+                    all_clip_rate_vals.append(float(row['shaping_clip_rate']))
+                if row.get('total_task_events'):
+                    all_task_events.append(float(row['total_task_events']))
+                if row.get('total_soup_delivery'):
+                    all_soup_del.append(float(row['total_soup_delivery']))
         summary.update({
+            'shaping_type': effective_type,
             'lambda_role': lambda_role,
+            'bonus_clip': bonus_clip,
             'role_window': role_window,
+            'mean_shaping_applied': float(np.mean(all_applied)) if all_applied else 0.0,
+            'shaping_clip_rate': float(np.mean(all_clip_rate_vals)) if all_clip_rate_vals else 0.0,
+            'mean_total_task_events': float(np.mean(all_task_events)) if all_task_events else 0.0,
+            'mean_total_soup_delivery': float(np.mean(all_soup_del)) if all_soup_del else 0.0,
         })
 
     with open(os.path.join(log_dir, 'summary.json'), 'w') as f:
@@ -422,15 +508,44 @@ def main():
                         help='Observation mode: egocentric (~520-dim per agent), '
                              'global_concat (~1040-dim both agents), '
                              'local (reserved for future)')
+    parser.add_argument('--shaping_type', default='none',
+                        choices=['none', 'raw_clipped', 'constant_bonus',
+                                 'event_density_bonus', 'event_binary_bonus',
+                                 'delivery_chain_bonus', 'delivery_chain_raw_clipped',
+                                 'normalized', 'weighted_normalized',
+                                 'delta_complementarity'],
+                        help='Shaping bonus type (default none)')
     parser.add_argument('--role_shaping', action='store_true', default=False,
-                        help='Enable role-level LOLA-like reward shaping (IPPO only)')
+                        help='[DEPRECATED] Use --shaping_type instead')
     parser.add_argument('--role_window', type=int, default=20,
                         help='Past episodes for teammate role tendency (default 20)')
     parser.add_argument('--lambda_role', type=float, default=0.1,
-                        help='Role bonus weight in training reward (default 0.1)')
-    parser.add_argument('--role_bonus_clip', type=float, default=1.0,
-                        help='Max absolute role bonus per episode (default 1.0)')
+                        help='Shaping bonus weight in training reward (default 0.1)')
+    parser.add_argument('--bonus_clip', type=float, default=1.0,
+                        help='Max absolute applied bonus per episode (default 1.0)')
+    parser.add_argument('--role_bonus_clip', type=float, default=None,
+                        help='[DEPRECATED] Use --bonus_clip')
+    parser.add_argument('--role_bonus_type', default=None,
+                        choices=['raw_clipped', 'normalized', 'weighted_normalized',
+                                 'delta_complementarity'],
+                        help='[DEPRECATED] Use --shaping_type')
     args = parser.parse_args()
+
+    # ── Resolve shaping_type, bonus_clip (backward compat) ──
+    shaping_type = args.shaping_type
+    bonus_clip = args.bonus_clip
+
+    # --role_shaping flag implies raw_clipped if no explicit shaping_type
+    if args.role_shaping and shaping_type == 'none':
+        shaping_type = 'raw_clipped'
+
+    # --role_bonus_type overrides shaping_type (deprecated)
+    if args.role_bonus_type is not None:
+        shaping_type = args.role_bonus_type
+
+    # --role_bonus_clip overrides --bonus_clip (deprecated)
+    if args.role_bonus_clip is not None:
+        bonus_clip = args.role_bonus_clip
 
     gpu_id = None
     if args.device == 'cpu':
@@ -461,7 +576,10 @@ def main():
         role_shaping=args.role_shaping,
         role_window=args.role_window,
         lambda_role=args.lambda_role,
-        role_bonus_clip=args.role_bonus_clip,
+        role_bonus_clip=args.role_bonus_clip or bonus_clip,
+        role_bonus_type=args.role_bonus_type or 'raw_clipped',
+        shaping_type=shaping_type,
+        bonus_clip=bonus_clip,
     )
 
 

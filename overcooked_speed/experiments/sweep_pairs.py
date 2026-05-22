@@ -24,7 +24,9 @@ def compute_summary_stats(summaries):
             'final_specialization_gated', 'final_sdelivery_gated',
             'final_scooking_gated',
             'T_reward_ok', 'T_specialization_ok',
-            'T_specialization_gated_ok']
+            'T_specialization_gated_ok',
+            'mean_shaping_applied', 'shaping_clip_rate',
+            'mean_total_task_events', 'mean_total_soup_delivery']
     agg = {}
     for k in keys:
         if k in summaries[0]:
@@ -75,15 +77,38 @@ def main():
     parser.add_argument('--obs_mode', default='egocentric',
                         choices=['egocentric', 'global_concat', 'local'],
                         help='Observation mode')
+    parser.add_argument('--shaping_type', default='none',
+                        choices=['none', 'raw_clipped', 'constant_bonus',
+                                 'event_density_bonus', 'event_binary_bonus',
+                                 'delivery_chain_bonus', 'delivery_chain_raw_clipped',
+                                 'normalized', 'weighted_normalized',
+                                 'delta_complementarity'],
+                        help='Shaping bonus type (default none)')
     parser.add_argument('--role_shaping', action='store_true', default=False,
-                        help='Enable role-level LOLA-like reward shaping (IPPO only)')
+                        help='[DEPRECATED] Use --shaping_type instead')
     parser.add_argument('--role_window', type=int, default=20,
                         help='Past episodes for teammate role tendency (default 20)')
     parser.add_argument('--lambda_role', type=float, default=0.1,
-                        help='Role bonus weight in training reward (default 0.1)')
-    parser.add_argument('--role_bonus_clip', type=float, default=1.0,
-                        help='Max absolute role bonus per episode (default 1.0)')
+                        help='Shaping bonus weight in training reward (default 0.1)')
+    parser.add_argument('--bonus_clip', type=float, default=1.0,
+                        help='Max absolute applied bonus per episode (default 1.0)')
+    parser.add_argument('--role_bonus_clip', type=float, default=None,
+                        help='[DEPRECATED] Use --bonus_clip')
+    parser.add_argument('--role_bonus_type', default=None,
+                        choices=['raw_clipped', 'normalized', 'weighted_normalized',
+                                 'delta_complementarity'],
+                        help='[DEPRECATED] Use --shaping_type')
     args = parser.parse_args()
+
+    # ── Resolve shaping_type, bonus_clip (backward compat) ──
+    shaping_type = args.shaping_type
+    bonus_clip = args.bonus_clip
+    if args.role_shaping and shaping_type == 'none':
+        shaping_type = 'raw_clipped'
+    if args.role_bonus_type is not None:
+        shaping_type = args.role_bonus_type
+    if args.role_bonus_clip is not None:
+        bonus_clip = args.role_bonus_clip
 
     parts = args.pairs.split(',')
     agent0_type = parts[0].strip()
@@ -121,7 +146,10 @@ def main():
             role_shaping=args.role_shaping,
             role_window=args.role_window,
             lambda_role=args.lambda_role,
-            role_bonus_clip=args.role_bonus_clip,
+            role_bonus_clip=args.role_bonus_clip or bonus_clip,
+            role_bonus_type=args.role_bonus_type or 'raw_clipped',
+            shaping_type=shaping_type,
+            bonus_clip=bonus_clip,
         )
         summary['agent0_type'] = agent0_type
         summary['agent1_type'] = agent1_type
@@ -135,6 +163,10 @@ def main():
     agg['agent1_type'] = agent1_type
     agg['layout'] = args.layout
     agg['seeds'] = args.seeds
+    if shaping_type != 'none':
+        agg['shaping_type'] = shaping_type
+        agg['lambda_role'] = args.lambda_role
+        agg['role_window'] = args.role_window
 
     os.makedirs(args.log_dir, exist_ok=True)
     csv_path = os.path.join(args.log_dir, 'summary_all.csv')
