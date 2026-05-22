@@ -26,7 +26,7 @@ from overcooked_speed.analysis.metrics import (
     gated_cooking_specialization,
     gated_overall_specialization,
 )
-from overcooked_speed.agents import create_agent, MAPPOManager
+from overcooked_speed.agents import create_agent, MAPPOManager, RoleShapingManager
 
 
 def select_device(gpu_id=None):
@@ -61,13 +61,19 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
              reward_threshold=20.0, spec_threshold=0.3,
              min_delivery_events=1, min_cooking_events=3,
              reward_shaping=True, ent_coef=0.05, ppo_epochs=4,
-             device='auto', algo='ippo', obs_mode='egocentric'):
+             device='auto', algo='ippo', obs_mode='egocentric',
+             role_shaping=False, role_window=20, lambda_role=0.1,
+             role_bonus_clip=1.0):
     """Run one agent pair for num_episodes and log results.
 
     Args:
         algo: 'ippo' (independent PPO) or 'mappo' (centralized-critic MAPPO).
         obs_mode: 'egocentric' (agent-specific ~520-dim) or 'global_concat'
                   (both agents see same ~1040-dim).
+        role_shaping: enable role-level LOLA-like reward shaping (IPPO only).
+        role_window: number of past episodes to estimate teammate role tendency.
+        lambda_role: weight of role bonus in training reward.
+        role_bonus_clip: max absolute role bonus per episode.
     """
 
     np.random.seed(seed)
@@ -95,6 +101,16 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
     n_actions = env.NUM_ACTIONS
 
     print(f"actor_obs_dim={obs_dim}  global_obs_dim={global_obs_dim}")
+
+    if role_shaping and algo == 'mappo':
+        raise NotImplementedError(
+            "Role shaping is currently only supported for IPPO (--algo ippo). "
+            "MAPPO already uses a centralized critic which captures role dynamics.")
+
+    if role_shaping:
+        print(f"Role shaping enabled: window={role_window} "
+              f"lambda={lambda_role} clip={role_bonus_clip}")
+        role_mgr = RoleShapingManager(window=role_window, bonus_clip=role_bonus_clip)
 
     if algo == 'mappo':
         mappo = MAPPOManager(obs_dim, n_actions, lr=lr, gamma=gamma,
@@ -130,13 +146,22 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
                     'a0_approx_kl', 'a1_approx_kl',
                     'a0_value_loss', 'a1_value_loss']
     mappo_extra = ['critic_loss', 'value_mean', 'advantage_mean']
+    role_fields = ['a0_role_bonus', 'a1_role_bonus',
+                   'a0_shaped_reward', 'a1_shaped_reward',
+                   'teammate0_p_cook', 'teammate0_p_deliver',
+                   'teammate1_p_cook', 'teammate1_p_deliver']
     spec_fields = ['s_delivery', 's_cooking', 's_overall',
                    's_delivery_gated', 's_cooking_gated', 's_overall_gated']
 
+    extra = []
+    if algo == 'mappo':
+        extra += mappo_extra
+    if role_shaping:
+        extra += role_fields
+
     fieldnames = (base_fields + a0_event_fields + a1_event_fields +
                   a0_action_fields + a1_action_fields +
-                  learn_fields + (mappo_extra if algo == 'mappo' else []) +
-                  spec_fields)
+                  learn_fields + extra + spec_fields)
 
     os.makedirs(log_dir, exist_ok=True)
     csv_path = os.path.join(log_dir, 'episodes.csv')
@@ -186,6 +211,32 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
         episode_rewards.append(ep_reward)
         counts = tracker.get_all_counts()
         episode_event_counts.append(counts)
+
+        # ── Role shaping (IPPO only, prior to training) ──
+        role_bonus0 = 0.0
+        role_bonus1 = 0.0
+        p_cook_0 = 0.5
+        p_deliver_0 = 0.5
+        p_cook_1 = 0.5
+        p_deliver_1 = 0.5
+
+        if role_shaping:
+            # Compute role bonuses from this episode's events,
+            # weighted by teammate tendency from *previous* episodes
+            role_bonus0 = role_mgr.compute_role_bonus(0, counts[0])
+            role_bonus1 = role_mgr.compute_role_bonus(1, counts[1])
+            p_cook_0, p_deliver_0 = role_mgr.get_teammate_tendency(0)
+            p_cook_1, p_deliver_1 = role_mgr.get_teammate_tendency(1)
+
+            shaped0 = lambda_role * role_bonus0
+            shaped1 = lambda_role * role_bonus1
+            agent0.add_terminal_bonus(float(shaped0))
+            agent1.add_terminal_bonus(float(shaped1))
+            ep_reward_shaped0 = ep_reward + float(shaped0)
+            ep_reward_shaped1 = ep_reward + float(shaped1)
+
+            # Record for next episode's tendency estimation
+            role_mgr.record_episode(counts[0], counts[1])
 
         # End-of-episode training
         if algo == 'mappo':
@@ -282,6 +333,15 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
             row['critic_loss'] = log.get('critic_loss', 0)
             row['value_mean'] = log.get('value_mean', 0)
             row['advantage_mean'] = log.get('advantage_mean', 0)
+        if role_shaping:
+            row['a0_role_bonus'] = role_bonus0
+            row['a1_role_bonus'] = role_bonus1
+            row['a0_shaped_reward'] = ep_reward_shaped0
+            row['a1_shaped_reward'] = ep_reward_shaped1
+            row['teammate0_p_cook'] = p_cook_0
+            row['teammate0_p_deliver'] = p_deliver_0
+            row['teammate1_p_cook'] = p_cook_1
+            row['teammate1_p_deliver'] = p_deliver_1
         writer.writerow(row)
 
     csv_file.close()
@@ -303,7 +363,13 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
         'device': str(torch_device),
         'min_delivery_events': min_delivery_events,
         'min_cooking_events': min_cooking_events,
+        'role_shaping': role_shaping,
     })
+    if role_shaping:
+        summary.update({
+            'lambda_role': lambda_role,
+            'role_window': role_window,
+        })
 
     with open(os.path.join(log_dir, 'summary.json'), 'w') as f:
         json.dump(summary, f, indent=2)
@@ -356,6 +422,14 @@ def main():
                         help='Observation mode: egocentric (~520-dim per agent), '
                              'global_concat (~1040-dim both agents), '
                              'local (reserved for future)')
+    parser.add_argument('--role_shaping', action='store_true', default=False,
+                        help='Enable role-level LOLA-like reward shaping (IPPO only)')
+    parser.add_argument('--role_window', type=int, default=20,
+                        help='Past episodes for teammate role tendency (default 20)')
+    parser.add_argument('--lambda_role', type=float, default=0.1,
+                        help='Role bonus weight in training reward (default 0.1)')
+    parser.add_argument('--role_bonus_clip', type=float, default=1.0,
+                        help='Max absolute role bonus per episode (default 1.0)')
     args = parser.parse_args()
 
     gpu_id = None
@@ -384,6 +458,10 @@ def main():
         device=gpu_id if gpu_id is not None else 'auto',
         algo=args.algo,
         obs_mode=args.obs_mode,
+        role_shaping=args.role_shaping,
+        role_window=args.role_window,
+        lambda_role=args.lambda_role,
+        role_bonus_clip=args.role_bonus_clip,
     )
 
 

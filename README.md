@@ -56,7 +56,12 @@ The shaping uses MDP-verified game stats to prevent reward exploitation — earl
 │  │ │Critic│ │Critic│ │    │   └──────────┘              │   │
 │  │ └──────┘ └──────┘ │    │   Shared GAE advantage       │   │
 │  │ Separate GAE + PPO │    │   CTDE: centralized training │   │
-│  └───────────────────┘    └─────────────────────────────┘   │
+│  │                    │    └─────────────────────────────┘   │
+│  │ + RoleShapingMgr   │                                      │
+│  │   teammate tendency│                                      │
+│  │   complementary    │                                      │
+│  │   role bonus       │                                      │
+│  └───────────────────┘                                      │
 ├──────────────────────────────────────────────────────────────┤
 │                     OvercookedWrapper                        │
 │  ┌───────────────────────────────────────────────────────┐  │
@@ -91,6 +96,32 @@ The shaping uses MDP-verified game stats to prevent reward exploitation — earl
 - **Actor update**: PPO clipped surrogate (same hyperparams as IPPO), no per-actor value loss term
 - **Critic update**: MSE regression on returns, independent optimizer
 - **Key difference from IPPO**: Rather than each agent learning its own value function from its own perspective, MAPPO uses a single centralized critic that sees the full global state — this stabilizes value estimation in cooperative tasks where individual observations are partial or noisy
+
+### Role Shaping (IPPO only) — `--role_shaping`
+
+A simple, interpretable, role-level LOLA-like method that encourages complementary role specialization **without second-order gradients or neural teammate models**. Applied only to IPPO; MAPPO already captures role dynamics via its centralized critic.
+
+**How it works:**
+
+1. **Track teammate role tendency from recent history**: For the past K episodes, count each agent's cooking events (onion pickup + pot placement) and delivery events (dish pickup + soup pickup + delivery). Compute `p_teammate_cook` and `p_teammate_deliver` — the teammate's probability of cooking vs delivering.
+
+2. **Reward complementary behavior**: At the end of each episode, compute a role bonus:
+   ```
+   bonus_i = p_teammate_cook × delivery_event_i + p_teammate_deliver × cooking_event_i
+   ```
+   If the teammate tends to cook (high `p_cook`), agent i is rewarded for delivering (complementary). If the teammate tends to deliver, agent i is rewarded for cooking.
+
+3. **No future leakage**: Teammate tendency for episode t uses only episodes [t-K, t-1]. Early episodes (before K episodes are collected) use a neutral prior (0.5, 0.5).
+
+4. **Bonus injected via GAE**: The shaped bonus is added to the last step's reward via `add_terminal_bonus()`, so GAE propagates it backward through the episode — rewarding all actions that led to complementary behavior.
+
+**Key design choices:**
+| Choice | Rationale |
+|--------|-----------|
+| Window K=20 | Smooths noise, adapts to role drift |
+| λ_role=0.1 | Small bonus relative to env reward (~20) — nudges without dominating |
+| Bonus clip ±1.0 | Prevents extreme bonuses from destabilizing PPO |
+| IPPO only | MAPPO's centralized critic already captures role dynamics |
 
 ### Observation Space
 
@@ -143,6 +174,13 @@ python overcooked_speed/experiments/run_pair.py \
     --agent0 nl --agent1 nl \
     --num_episodes 100 --seed 0 --log_dir logs/demo_mappo
 
+# IPPO + Role Shaping (teammate-aware complementary reward)
+python overcooked_speed/experiments/run_pair.py \
+    --layout cramped_room --algo ippo --obs_mode egocentric \
+    --role_shaping --lambda_role 0.1 --role_window 20 \
+    --agent0 nl --agent1 nl \
+    --num_episodes 100 --seed 0 --log_dir logs/demo_role
+
 # Multi-seed sweep (500 episodes × 3 seeds, GPU auto-detect)
 python overcooked_speed/experiments/sweep_pairs.py \
     --layout cramped_room --pairs nl,nl \
@@ -172,6 +210,10 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 | `--ppo_epochs` | 4 | PPO update epochs per episode |
 | `--algo` | `ippo` | Algorithm: `ippo` (independent PPO) or `mappo` (centralized-critic MAPPO) |
 | `--obs_mode` | `egocentric` | Observation mode: `egocentric` (~520-dim), `global_concat` (~1040-dim), `local` (reserved) |
+| `--role_shaping` | `False` | Enable role-level LOLA-like reward shaping (IPPO only) |
+| `--role_window` | 20 | Past episodes for teammate role tendency estimation |
+| `--lambda_role` | 0.1 | Role bonus weight in training reward |
+| `--role_bonus_clip` | 1.0 | Max absolute role bonus per episode |
 | `--log_dir` | `logs/smoke` | Output directory for CSVs and summary JSON |
 
 `sweep_pairs.py` adds:
@@ -182,28 +224,53 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 | `--seeds` | `0 1 2` | Random seeds for multi-seed averaging |
 | `--algo` | `ippo` | Algorithm: `ippo` or `mappo` |
 | `--obs_mode` | `egocentric` | Observation mode: `egocentric`, `global_concat`, `local` |
+| `--role_shaping` | `False` | Enable role shaping (IPPO only, ignored for MAPPO) |
+| `--role_window` | 20 | Past episodes for teammate tendency |
+| `--lambda_role` | 0.1 | Role bonus weight |
+| `--role_bonus_clip` | 1.0 | Max absolute role bonus |
 
-## Key Findings (v5: game_stats-verified reward shaping)
+## Key Findings
 
-**500 episodes × 3 seeds on cramped_room, NL+NL (PPO)**
+### Baseline Sweep: IPPO vs MAPPO (500ep × 5 seeds)
 
-| Metric | Mean ± Std |
-|--------|-----------|
-| Final Reward (last 50 ep) | 33.7 ± 9.2 |
-| T_reward (convergence ep) | 222 ± 60 |
-| **Final Specialization** | **0.81 ± 0.04** |
-| Delivery Specialization | 0.90 ± 0.07 |
-| Cooking Specialization | 0.72 ± 0.03 |
-| T_specialization | 47 ± 16 |
-| Total Deliveries (per seed) | 653–768 |
+**cramped_room, egocentric obs (520-dim actor), shaped reward**
+
+| Config | final_reward | reward_auc | T_reward | final_spec | T_spec |
+|--------|-------------|------------|----------|------------|--------|
+| IPPO-egocentric | 29.6 ± 6.8 | 8699 ± 989 | 299.8 | 0.768 ± 0.039 | 116.6 |
+| IPPO-global_concat | 34.5 ± 7.7 | 9952 ± 884 | 237.8 | 0.804 ± 0.042 | 53.0 |
+| MAPPO-egocentric | **80.0 ± 21.4** | **18068 ± 4446** | **246.0** | **0.867 ± 0.038** | **49.6** |
+| MAPPO-global_concat | 78.1 ± 18.1 | 16404 ± 2983 | 195.0 | 0.811 ± 0.088 | 40.0 |
+
+### IPPO + Role Shaping (500ep × 5 seeds)
+
+| Config | final_reward | reward_auc | T_reward | final_spec | T_spec |
+|--------|-------------|------------|----------|------------|--------|
+| IPPO-ego (baseline) | 29.6 ± 6.8 | 8699 ± 989 | 299.8 | 0.768 ± 0.039 | 116.6 |
+| **IPPO-role-shaping** | **45.3 ± 18.9** | **10096 ± 2740** | **365.0** | **0.733 ± 0.039** | **78.0** |
+| MAPPO-ego (upper bound) | 80.0 ± 21.4 | 18068 ± 4446 | 246.0 | 0.867 ± 0.038 | 49.6 |
+
+**Per-seed breakdown (IPPO-role-shaping):**
+
+| Seed | final_reward | T_reward | spec | Agent 0 | Agent 1 |
+|------|-------------|----------|------|---------|---------|
+| 0 | 23.3 | 500 ✗ | 0.669 | 318 del / 1757 cook | 30 del / 5412 cook |
+| 1 | 22.2 | 500 ✗ | 0.740 | 349 del / 1514 cook | 23 del / 6142 cook |
+| 2 | 52.6 | 303 ✓ | 0.715 | 23 del / 1931 cook | 448 del / 6261 cook |
+| 3 | 66.2 | 225 ✓ | 0.780 | 792 del / 1689 cook | 32 del / 7626 cook |
+| 4 | 62.0 | 297 ✓ | 0.761 | 18 del / 6735 cook | 582 del / 1778 cook |
 
 ### Observations
-1. **Role specialization is robust**: across all 3 seeds, one agent consistently becomes the cook (7,000+ cooking events) and the other the deliverer (600+ deliveries)
-2. **Specialization precedes convergence**: T_spec ≈ 47 vs T_reward ≈ 222 — agents learn *who does what* long before they learn *how to do it well*
-3. **Delivery specialization (0.90) > Cooking specialization (0.72)**: the delivery role is more sharply divided because only one agent can deliver at the serving station at a time
-4. **Reward shaping anti-exploitation**: using `game_stats['potting_onion']` delta (MDP-verified) prevents the reward hacking seen in earlier versions where agents spammed onion pickups without progressing the task
 
-**MAPPO (Centralized Critic)** is available via `--algo mappo` as a strong CTDE baseline. The key comparison is **IPPO-egocentric vs MAPPO-egocentric** — both use the same 520-dim actor input, so MAPPO's advantage comes purely from its centralized critic (1040-dim global state). Additional CSV fields beyond IPPO:
+1. **MAPPO dominates IPPO**: With identical 520-dim egocentric actor input, MAPPO's centralized critic achieves 2.7× higher reward (80.0 vs 29.6) — value estimation, not policy optimization, is the bottleneck in this cooperative task
+2. **Observation mode matters less for MAPPO**: MAPPO-egocentric (80.0) ≈ MAPPO-global_concat (78.1) — the centralized critic already sees full global state regardless of actor obs mode
+3. **Global observation helps IPPO modestly**: IPPO-global (34.5) beats IPPO-ego (29.6) by +17% — seeing both perspectives helps even without centralized training
+4. **Role shaping improves IPPO by +53%** (45.3 vs 29.6) but with high variance — 3/5 seeds converge well (52-66 reward), 2/5 fail (22-23). When it works, specialization emerges faster (T_spec=78 vs 117) and reward approaches the IPPO-global baseline. When it doesn't, the constant bonus signal (saturated at clip=1.0) fails to provide useful gradient information
+5. **Role shaping does not approach MAPPO**: MAPPO-ego still leads by 1.8× in reward (80.0 vs 45.3). The centralized critic captures richer coordination signals than the simple role-count bonus
+6. **Current limitation — bonus saturation**: With `bonus_clip=1.0`, the raw role bonus (p_cook × deliveries + p_deliver × cooking) routinely exceeds 1.0 in a 400-step episode (15-20+ events), so the bonus clips to 1.0 almost every episode. This turns `lambda_role * bonus = 0.1` into a constant shift rather than a behavior-sensitive gradient. Future work: increase clip, normalize by episode steps, or use ranking-based bonus
+7. **Reward shaping anti-exploitation**: using `game_stats['potting_onion']` delta (MDP-verified) prevents the reward hacking seen in earlier versions where agents spammed onion pickups without progressing the task
+
+**MAPPO CSV fields** (beyond IPPO):
 
 | Field | Description |
 |-------|-------------|
@@ -211,9 +278,14 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 | `value_mean` | Mean V(s) across episode timesteps |
 | `advantage_mean` | Mean GAE advantage (before normalization) |
 
-Summary JSON also records `obs_mode`, `actor_obs_dim`, and `global_obs_dim` for each run.
+**Role shaping CSV fields** (beyond IPPO):
 
-MAPPO serves as a comparison point for future teammate-aware methods (LOLA, Lookahead) — if MAPPO's centralized critic substantially outperforms IPPO, it suggests value estimation (not policy optimization) is the bottleneck in this cooperative task.
+| Field | Description |
+|-------|-------------|
+| `a0_role_bonus` / `a1_role_bonus` | Raw role bonus per agent (before λ_role scaling) |
+| `a0_shaped_reward` / `a1_shaped_reward` | Episode reward + λ_role × role_bonus |
+| `teammate0_p_cook` / `teammate0_p_deliver` | Agent 0's teammate (agent 1) role tendency |
+| `teammate1_p_cook` / `teammate1_p_deliver` | Agent 1's teammate (agent 0) role tendency |
 
 ### Reward Shaping Evolution
 
@@ -239,6 +311,7 @@ overcooked/
 │   ├── agents/
 │   │   ├── pg_agent.py               # IPPO agent with GAE + clip
 │   │   ├── mappo_agent.py            # MAPPO: centralized critic + two actors
+│   │   ├── role_shaping.py           # Role-level LOLA-like teammate-aware bonus
 │   │   └── policy.py                 # Actor-Critic network (shared MLP)
 │   ├── envs/
 │   │   ├── overcooked_wrapper.py     # Unified env API + reward shaping
@@ -271,8 +344,7 @@ Implement and benchmark agents that account for *other agents' learning*:
 | **Lookahead** | Simulate k steps of joint learning then take the first gradient step — a form of model-based multi-agent planning |
 | **Ideal Jπ** | Exact analytical joint policy gradient — serves as an upper-bound oracle for cooperative settings |
 
-**Current baseline**: IPPO (independent PPO) and MAPPO (centralized-critic CTDE) are implemented.
-MAPPO provides the centralized-training reference point — LOLA/Lookahead should be compared against both to isolate the benefit of teammate-awareness from the benefit of global-state value estimation.
+**Current baseline**: IPPO (independent PPO), MAPPO (centralized-critic CTDE), and **IPPO+role-shaping** (teammate-aware complementary bonus) are implemented. MAPPO provides the centralized-training reference point — LOLA/Lookahead should be compared against all three to isolate the benefit of second-order gradient information from simpler teammate-aware heuristics.
 
 **Hypothesis**: LOLA and Lookahead should accelerate T_reward (faster convergence) and produce more stable specialization compared to naive learners, because they account for co-adaptation effects that NL agents treat as environmental noise.
 

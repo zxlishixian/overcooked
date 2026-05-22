@@ -75,6 +75,14 @@ def main():
     parser.add_argument('--obs_mode', default='egocentric',
                         choices=['egocentric', 'global_concat', 'local'],
                         help='Observation mode')
+    parser.add_argument('--role_shaping', action='store_true', default=False,
+                        help='Enable role-level LOLA-like reward shaping (IPPO only)')
+    parser.add_argument('--role_window', type=int, default=20,
+                        help='Past episodes for teammate role tendency (default 20)')
+    parser.add_argument('--lambda_role', type=float, default=0.1,
+                        help='Role bonus weight in training reward (default 0.1)')
+    parser.add_argument('--role_bonus_clip', type=float, default=1.0,
+                        help='Max absolute role bonus per episode (default 1.0)')
     args = parser.parse_args()
 
     parts = args.pairs.split(',')
@@ -110,6 +118,10 @@ def main():
             device=gpu_id if gpu_id is not None else 'auto',
             algo=args.algo,
             obs_mode=args.obs_mode,
+            role_shaping=args.role_shaping,
+            role_window=args.role_window,
+            lambda_role=args.lambda_role,
+            role_bonus_clip=args.role_bonus_clip,
         )
         summary['agent0_type'] = agent0_type
         summary['agent1_type'] = agent1_type

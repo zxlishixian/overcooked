@@ -1,6 +1,7 @@
 from .pg_agent import PGAgent
 from .policy import ActorCritic
 from .mappo_agent import MAPPOManager, CentralizedCritic
+from .role_shaping import RoleShapingManager
 
 # Future: from .lola_agent import LOLAAgent
 # Future: from .lookahead_agent import LookaheadAgent

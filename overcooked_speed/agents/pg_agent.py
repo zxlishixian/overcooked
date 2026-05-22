@@ -55,6 +55,11 @@ class PGAgent:
         self._rewards.append(reward)
         self._dones.append(False)
 
+    def add_terminal_bonus(self, bonus):
+        """Add bonus to the last stored reward (for role shaping at episode end)."""
+        if self._rewards:
+            self._rewards[-1] += bonus
+
     def end_episode(self):
         """Compute GAE and run PPO updates."""
         import torch
