@@ -64,19 +64,20 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
              device='auto', algo='ippo', obs_mode='egocentric',
              role_shaping=False, role_window=20, lambda_role=0.1,
              role_bonus_clip=1.0, role_bonus_type='raw_clipped',
-             shaping_type='none', bonus_clip=1.0):
+             shaping_type='none', bonus_clip=1.0,
+             w_onion_pickup=0.1, w_potting=1.0, w_dish_pickup=0.2,
+             w_soup_pickup=0.7, w_delivery=1.0):
     """Run one agent pair for num_episodes and log results.
 
     Args:
         algo: 'ippo' (independent PPO) or 'mappo' (centralized-critic MAPPO).
         obs_mode: 'egocentric' (agent-specific ~520-dim) or 'global_concat'
                   (both agents see same ~1040-dim).
-        shaping_type: 'none', 'raw_clipped', 'constant_bonus',
-            'event_density_bonus', 'event_binary_bonus',
-            'delivery_chain_bonus', 'delivery_chain_raw_clipped',
-            'normalized', 'weighted_normalized', 'delta_complementarity'.
+        shaping_type: shaping bonus type (see VALID_SHAPING_TYPES).
         lambda_role: weight of shaping bonus in training reward.
         bonus_clip: max absolute applied bonus per episode.
+        w_onion_pickup, w_potting, w_dish_pickup, w_soup_pickup, w_delivery:
+            task-progress weights (for task-level shaping types).
         role_shaping, role_bonus_type, role_bonus_clip: deprecated aliases.
     """
 
@@ -121,7 +122,12 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
               f"window={role_window} lambda={lambda_role} clip={bonus_clip}")
         role_mgr = RoleShapingManager(window=role_window, bonus_clip=bonus_clip,
                                        shaping_type=effective_type,
-                                       lambda_role=lambda_role)
+                                       lambda_role=lambda_role,
+                                       w_onion_pickup=w_onion_pickup,
+                                       w_potting=w_potting,
+                                       w_dish_pickup=w_dish_pickup,
+                                       w_soup_pickup=w_soup_pickup,
+                                       w_delivery=w_delivery)
 
     if algo == 'mappo':
         mappo = MAPPOManager(obs_dim, n_actions, lr=lr, gamma=gamma,
@@ -165,10 +171,14 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
         'a0_shaped_reward', 'a1_shaped_reward',
         'total_task_events', 'total_potting', 'total_soup_pickup',
         'total_soup_delivery',
+        'total_onion_pickup', 'total_dish_pickup',
         # Role-specific (populated only for role types)
         'teammate0_p_cook', 'teammate0_p_deliver',
         'teammate1_p_cook', 'teammate1_p_deliver',
         'complementarity_current', 'complementarity_delta',
+        # Task-lookahead-specific
+        'teammate0_p_potting', 'teammate0_p_delivery',
+        'teammate1_p_potting', 'teammate1_p_delivery',
     ]
     spec_fields = ['s_delivery', 's_cooking', 's_overall',
                    's_delivery_gated', 's_cooking_gated', 's_overall_gated']
@@ -238,12 +248,16 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
         s_clipped = False
         p_cook_0 = p_deliver_0 = 0.5
         p_cook_1 = p_deliver_1 = 0.5
+        p_pot_0 = p_del_0 = 0.5
+        p_pot_1 = p_del_1 = 0.5
         comp_current = 0.5
         comp_delta = 0.0
         total_task_events = 0.0
         total_potting = 0.0
         total_soup_pickup = 0.0
         total_soup_delivery = 0.0
+        total_onion_pickup = 0.0
+        total_dish_pickup = 0.0
 
         if effective_type != 'none':
             # Pre-compute aggregate event counts
@@ -253,12 +267,17 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
                                 counts[1].get('pickup_soup', 0))
             total_soup_delivery = (counts[0].get('deliver_soup', 0) +
                                   counts[1].get('deliver_soup', 0))
+            total_onion_pickup = (counts[0].get('pickup_onion', 0) +
+                                 counts[1].get('pickup_onion', 0))
+            total_dish_pickup = (counts[0].get('pickup_dish', 0) +
+                                counts[1].get('pickup_dish', 0))
             total_task_events = (
-                counts[0].get('pickup_onion', 0) + counts[1].get('pickup_onion', 0) +
-                total_potting +
-                counts[0].get('pickup_dish', 0) + counts[1].get('pickup_dish', 0) +
-                total_soup_pickup +
+                total_onion_pickup + total_potting +
+                total_dish_pickup + total_soup_pickup +
                 total_soup_delivery)
+
+            # For task-level types that need both agents' counts
+            role_mgr.set_episode_counts(counts[0], counts[1])
 
             # For delta type: set both agents' counts before computing bonus
             if effective_type == 'delta_complementarity':
@@ -276,6 +295,11 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
                 if effective_type == 'delta_complementarity':
                     comp_current = role_mgr.get_complementarity(counts[0], counts[1])
                     comp_delta = s_app0  # same for both agents
+
+            # For task-lookahead types: get teammate task tendencies
+            if role_mgr.is_task_lookahead_type:
+                p_pot_0, p_del_0 = role_mgr.get_teammate_task_tendency(0)
+                p_pot_1, p_del_1 = role_mgr.get_teammate_task_tendency(1)
 
             shaped0 = lambda_role * s_app0
             shaped1 = lambda_role * s_app1
@@ -397,6 +421,8 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
             row['total_potting'] = total_potting
             row['total_soup_pickup'] = total_soup_pickup
             row['total_soup_delivery'] = total_soup_delivery
+            row['total_onion_pickup'] = total_onion_pickup
+            row['total_dish_pickup'] = total_dish_pickup
             # Role-specific fields (only for role types)
             row['teammate0_p_cook'] = p_cook_0
             row['teammate0_p_deliver'] = p_deliver_0
@@ -404,6 +430,11 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
             row['teammate1_p_deliver'] = p_deliver_1
             row['complementarity_current'] = comp_current
             row['complementarity_delta'] = comp_delta
+            # Task-lookahead-specific fields
+            row['teammate0_p_potting'] = p_pot_0
+            row['teammate0_p_delivery'] = p_del_0
+            row['teammate1_p_potting'] = p_pot_1
+            row['teammate1_p_delivery'] = p_del_1
         writer.writerow(row)
 
     csv_file.close()
@@ -435,6 +466,8 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
         all_clip_rate_vals = []
         all_task_events = []
         all_soup_del = []
+        all_potting = []
+        all_soup_pickup = []
         with open(csv_path, 'r') as f:
             reader = csv_module.DictReader(f)
             for row in reader:
@@ -446,6 +479,10 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
                     all_task_events.append(float(row['total_task_events']))
                 if row.get('total_soup_delivery'):
                     all_soup_del.append(float(row['total_soup_delivery']))
+                if row.get('total_potting'):
+                    all_potting.append(float(row['total_potting']))
+                if row.get('total_soup_pickup'):
+                    all_soup_pickup.append(float(row['total_soup_pickup']))
         summary.update({
             'shaping_type': effective_type,
             'lambda_role': lambda_role,
@@ -455,6 +492,16 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
             'shaping_clip_rate': float(np.mean(all_clip_rate_vals)) if all_clip_rate_vals else 0.0,
             'mean_total_task_events': float(np.mean(all_task_events)) if all_task_events else 0.0,
             'mean_total_soup_delivery': float(np.mean(all_soup_del)) if all_soup_del else 0.0,
+            'mean_total_potting': float(np.mean(all_potting)) if all_potting else 0.0,
+            'mean_total_soup_pickup': float(np.mean(all_soup_pickup)) if all_soup_pickup else 0.0,
+        })
+        # Include task weight params in summary
+        summary.update({
+            'w_onion_pickup': w_onion_pickup,
+            'w_potting': w_potting,
+            'w_dish_pickup': w_dish_pickup,
+            'w_soup_pickup': w_soup_pickup,
+            'w_delivery': w_delivery,
         })
 
     with open(os.path.join(log_dir, 'summary.json'), 'w') as f:
@@ -513,7 +560,10 @@ def main():
                                  'event_density_bonus', 'event_binary_bonus',
                                  'delivery_chain_bonus', 'delivery_chain_raw_clipped',
                                  'normalized', 'weighted_normalized',
-                                 'delta_complementarity'],
+                                 'delta_complementarity',
+                                 'self_task_progress', 'team_task_progress',
+                                 'teammate_task_progress', 'task_lookahead_rule',
+                                 'task_lola_rule', 'team_bottleneck_progress'],
                         help='Shaping bonus type (default none)')
     parser.add_argument('--role_shaping', action='store_true', default=False,
                         help='[DEPRECATED] Use --shaping_type instead')
@@ -529,6 +579,16 @@ def main():
                         choices=['raw_clipped', 'normalized', 'weighted_normalized',
                                  'delta_complementarity'],
                         help='[DEPRECATED] Use --shaping_type')
+    parser.add_argument('--w_onion_pickup', type=float, default=0.1,
+                        help='Task weight: onion pickup (default 0.1)')
+    parser.add_argument('--w_potting', type=float, default=1.0,
+                        help='Task weight: potting onion (default 1.0)')
+    parser.add_argument('--w_dish_pickup', type=float, default=0.2,
+                        help='Task weight: dish pickup (default 0.2)')
+    parser.add_argument('--w_soup_pickup', type=float, default=0.7,
+                        help='Task weight: soup pickup (default 0.7)')
+    parser.add_argument('--w_delivery', type=float, default=1.0,
+                        help='Task weight: soup delivery (default 1.0)')
     args = parser.parse_args()
 
     # ── Resolve shaping_type, bonus_clip (backward compat) ──
@@ -580,6 +640,11 @@ def main():
         role_bonus_type=args.role_bonus_type or 'raw_clipped',
         shaping_type=shaping_type,
         bonus_clip=bonus_clip,
+        w_onion_pickup=args.w_onion_pickup,
+        w_potting=args.w_potting,
+        w_dish_pickup=args.w_dish_pickup,
+        w_soup_pickup=args.w_soup_pickup,
+        w_delivery=args.w_delivery,
     )
 
 

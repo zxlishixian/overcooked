@@ -99,7 +99,7 @@ The shaping uses MDP-verified game stats to prevent reward exploitation — earl
 
 ### Unified Shaping API — `--shaping_type`
 
-A general-purpose mechanism diagnosis API that supports 10 shaping types for understanding *why* role shaping works (or doesn't). All types inject a per-episode bonus via `add_terminal_bonus()`, propagated backward through the trajectory by GAE.
+A general-purpose mechanism diagnosis API that supports 16 shaping types across two levels (role-based and task-based) for understanding *why* shaping works (or doesn't). All types inject a per-episode bonus via `add_terminal_bonus()`, propagated backward through the trajectory by GAE.
 
 **Architecture**: A single `RoleShapingManager` class in [role_shaping.py](overcooked_speed/agents/role_shaping.py) dispatches via `_compute_raw()` based on `shaping_type`. Methods that use teammate role history (`_ROLE_TYPES`) call `record_episode()` to maintain a sliding window of past episode counts. Diagnostic methods compute the bonus purely from the current episode's event counts.
 
@@ -117,6 +117,26 @@ A general-purpose mechanism diagnosis API that supports 10 shaping types for und
 | `event_binary_bonus` | Simple event-occurrence signal | No | 1.0 if any useful event occurred |
 | `delivery_chain_bonus` | Weighted task-progress (normalized) | No | `weighted_chain / total_actions` |
 | `delivery_chain_raw_clipped` | Weighted task-progress (raw, clipped) | No | `weighted_chain` (clipped to ±bonus_clip) |
+
+**Task-level shaping types** (operate on 5 task-progress events: onion_pickup, potting, dish_pickup, soup_pickup, delivery):
+
+| `--shaping_type` | Mechanism tested | Uses teammate history | Bonus formula |
+|------------------|------------------|----------------------|---------------|
+| `self_task_progress` | Own task-progress density | No | Σ w_i × count_i (own events) |
+| `team_task_progress` | Shared team task-progress | No (uses both agents' counts) | Σ w_i × (count_i^0 + count_i^1) |
+| `teammate_task_progress` | LOLA-like: own bonus from teammate's progress | No (uses teammate's counts) | Σ w_i × count_i^teammate |
+| `task_lookahead_rule` | Lookahead-like: complementary task shaping | Yes (K=20) | p_pot × my_delivery + p_del × my_potting |
+| `task_lola_rule` | Focused teammate bottleneck-task shaping | No (uses teammate's counts) | 1.2×potting_tm + 0.7×soup_tm + 1.0×delivery_tm |
+| `team_bottleneck_progress` | Shared bottleneck-task bonus | No (uses both agents' counts) | 1.2×Σpotting + 0.7×Σsoup + 1.0×Σdelivery |
+
+**Task weights:**
+| Weight | Event | Default | Rationale |
+|--------|-------|---------|-----------|
+| `w_onion_pickup` | Pick up onion from dispenser | 0.1 | Trivial action, easy to spam |
+| `w_potting` | Place onion in pot | 1.0 | Bottleneck: 3 onions/soup required |
+| `w_dish_pickup` | Pick up dish from dispenser | 0.2 | Prerequisite but easy |
+| `w_soup_pickup` | Pick up soup from full pot | 0.7 | Key coordination handoff |
+| `w_delivery` | Deliver soup to serving station | 1.0 | Primary goal event |
 
 **Key design decisions:**
 | Choice | Rationale |
@@ -223,10 +243,15 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 | `--ppo_epochs` | 4 | PPO update epochs per episode |
 | `--algo` | `ippo` | Algorithm: `ippo` (independent PPO) or `mappo` (centralized-critic MAPPO) |
 | `--obs_mode` | `egocentric` | Observation mode: `egocentric` (~520-dim), `global_concat` (~1040-dim), `local` (reserved) |
-| `--shaping_type` | `none` | Shaping bonus type: `none`, `raw_clipped`, `normalized`, `weighted_normalized`, `delta_complementarity`, `constant_bonus`, `event_density_bonus`, `event_binary_bonus`, `delivery_chain_bonus`, `delivery_chain_raw_clipped` |
-| `--bonus_clip` | 1.0 | Max absolute bonus per episode (applied after bonus_type raw compute) |
+| `--shaping_type` | `none` | Shaping bonus type: `none`, `raw_clipped`, `normalized`, `weighted_normalized`, `delta_complementarity`, `constant_bonus`, `event_density_bonus`, `event_binary_bonus`, `delivery_chain_bonus`, `delivery_chain_raw_clipped`, `self_task_progress`, `team_task_progress`, `teammate_task_progress`, `task_lookahead_rule`, `task_lola_rule`, `team_bottleneck_progress` |
+| `--bonus_clip` | 1.0 | Max absolute bonus per episode (applied after bonus_type raw compute; 3.0–5.0 recommended for task-level types) |
 | `--lambda_role` | 0.1 | Shaping bonus weight in training reward |
-| `--role_window` | 20 | Past episodes for teammate role tendency (role-based types only) |
+| `--role_window` | 20 | Past episodes for teammate tendency (role-based + task_lookahead_rule types) |
+| `--w_onion_pickup` | 0.1 | Task weight: onion pickup from dispenser |
+| `--w_potting` | 1.0 | Task weight: place onion in pot |
+| `--w_dish_pickup` | 0.2 | Task weight: dish pickup from dispenser |
+| `--w_soup_pickup` | 0.7 | Task weight: soup pickup from full pot |
+| `--w_delivery` | 1.0 | Task weight: soup delivery to serving station |
 | `--role_shaping` | `False` | ⚠️ Deprecated — use `--shaping_type raw_clipped` |
 | `--role_bonus_type` | — | ⚠️ Deprecated — use `--shaping_type` |
 | `--role_bonus_clip` | — | ⚠️ Deprecated — use `--bonus_clip` |
@@ -286,6 +311,43 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 5. **Role shaping does not approach MAPPO**: MAPPO-ego still leads by 1.8× in reward (80.0 vs 45.3). The centralized critic captures richer coordination signals than the simple role-count bonus
 6. **Current limitation — bonus saturation**: With `bonus_clip=1.0`, the raw role bonus (p_cook × deliveries + p_deliver × cooking) routinely exceeds 1.0 in a 400-step episode (15-20+ events), so the bonus clips to 1.0 almost every episode. This turns `lambda_role * bonus = 0.1` into a constant shift rather than a behavior-sensitive gradient. Future work: increase clip, normalize by episode steps, or use ranking-based bonus
 7. **Reward shaping anti-exploitation**: using `game_stats['potting_onion']` delta (MDP-verified) prevents the reward hacking seen in earlier versions where agents spammed onion pickups without progressing the task
+
+### Task-Level Shaping Sweep: 6 Types × 2λ × 2 Clips (300ep × 3 seeds)
+
+After discovering that task-progress events (especially `total_potting`) have the strongest correlation with reward (ρ=0.963), we tested 6 new shaping types that directly reward task/subtask progress events instead of abstract role complementarity. Default task weights: w_potting=1.0, w_delivery=1.0, w_soup_pickup=0.7, w_dish_pickup=0.2, w_onion_pickup=0.1. Sweep over λ ∈ {0.03, 0.1}, bonus_clip ∈ {3.0, 5.0}.
+
+**Top 5 configs (of 24):**
+
+| Rank | shaping_type | λ | clip | final_r | r_auc | T_rew | T_spec |
+|------|-------------|---|------|---------|-------|-------|--------|
+| 1 | team_task_progress | 0.100 | 3.0 | 25.4±0.0 | 4343 | 238 | 34 |
+| 2 | self_task_progress | 0.030 | 3.0 | 24.1±2.6 | 4367 | 250 | 55 |
+| 3 | teammate_task_progress | 0.100 | 3.0 | 24.0±2.6 | 4173 | 248 | 35 |
+| 4 | team_bottleneck_progress | 0.030 | 3.0 | 23.6±6.8 | 4364 | 255 | 69 |
+| 5 | team_bottleneck_progress | 0.030 | 5.0 | 22.8±2.6 | 3976 | 273 | 76 |
+| ref | **IPPO-ego** (500ep) | — | — | **29.6±6.8** | **8699** | **300** | **117** |
+| ref | **raw_clipped_role** (500ep) | — | — | **45.3±18.9** | **10096** | **365** | **78** |
+| ref | **MAPPO-ego** (500ep) | — | — | **80.0±21.4** | **18068** | **246** | **50** |
+
+**Full results**: 24 rows in `logs/task_shaping_sweep/task_sweep_summary.csv`.
+
+**Key findings:**
+
+1. **No task-level variant beats IPPO baseline.** The best (team_task_progress, 25.4) is still below IPPO-ego (29.6) and far below raw_clipped role shaping (45.3). The task-progress bonus signal appears to overwhelm the sparse delivery reward, diluting the gradient.
+
+2. **Lower λ dominates**: λ=0.03, clip=3.0 appears in 4 of the top 5. Higher λ (0.1) + higher clip (5.0) consistently underperforms — the injected bonus is too large relative to the sparse goal signal.
+
+3. **team_task_progress is most stable**: At λ=0.1, c=3.0, σ=0.0 across 3 seeds. Shared team bonus creates consistent incentives with no zero-sum dynamics.
+
+4. **task_lookahead_rule fails**: The worst performer (17.4–20.5). Predicting teammate's task tendency and rewarding complementary progress does not produce useful specialization — the prediction signal is too noisy at K=20.
+
+5. **task_lola_rule vs teammate_task_progress**: Bottleneck-weighted teammate bonus (22.1 max) underperforms uniform-weighted teammate progress (24.0 max). The bottleneck weighting doesn't add value over treating all tasks equally.
+
+6. **T_specialization improves**: Best configs reach T_spec=34 (vs IPPO's 117), confirming that task shaping accelerates role emergence. However, the faster specialization comes at the cost of lower final reward — agents specialize into suboptimal patterns.
+
+7. **At 300ep, a 3× reward gap from MAPPO**: Top task-level result (25.4) vs MAPPO (80.0). Rule-based task shaping cannot substitute for centralized value estimation.
+
+8. **Recommended next steps before neural teammate models**: (a) Lower λ to 0.01 or 0.005 to reduce signal dominance, (b) λ-annealing (start high for specialization, decay to 0), (c) use task shaping as auxiliary loss rather than reward injection.
 
 ### Mechanism Diagnosis: Why Does Role Shaping Help? (300ep × 3 seeds)
 
@@ -366,8 +428,12 @@ The script reads all episode CSVs recursively, computes derived signals (total_c
 | `complementarity_delta` | C_current − mean(C_history) |
 | `total_task_events` | Sum of cooking + delivery events |
 | `total_potting` | Total onions placed in pots |
+| `total_onion_pickup` | Total onions picked up from dispenser |
+| `total_dish_pickup` | Total dishes picked up from dispenser |
 | `total_soup_pickup` | Total soups picked up |
 | `total_soup_delivery` | Total soups delivered |
+| `teammate0_p_potting` / `teammate0_p_delivery` | Agent 0's teammate (agent 1) task tendency (task_lookahead only) |
+| `teammate1_p_potting` / `teammate1_p_delivery` | Agent 1's teammate (agent 0) task tendency (task_lookahead only) |
 
 ### Reward Shaping Evolution
 
@@ -402,11 +468,14 @@ overcooked/
 │   ├── analysis/
 │   │   ├── metrics.py                # Convergence & specialization metrics
 │   │   ├── analyze_shaping_signal.py # Correlation: shaping signals vs reward
+│   │   ├── aggregate_task_sweep.py   # Aggregate task shaping sweep results
 │   │   ├── plot_learning_curves.py   # Reward/spec/action/learning curves
 │   │   └── plot_heatmap.py           # Bar/heatmap across algorithm pairs
 │   ├── experiments/
 │   │   ├── run_pair.py               # Single pair training + CSV logging
-│   │   └── sweep_pairs.py            # Multi-seed sweep + aggregation
+│   │   ├── sweep_pairs.py            # Multi-seed sweep + aggregation
+│   │   ├── gen_sweep_scripts.py      # Generate per-GPU shell scripts for sweeps
+│   │   └── launch_task_sweep.py      # Sequential job launcher (alternative)
 │   ├── algos/                        # (future) Algorithm implementations
 │   └── configs/                      # (future) Experiment config files
 │

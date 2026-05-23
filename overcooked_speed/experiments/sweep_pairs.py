@@ -26,7 +26,8 @@ def compute_summary_stats(summaries):
             'T_reward_ok', 'T_specialization_ok',
             'T_specialization_gated_ok',
             'mean_shaping_applied', 'shaping_clip_rate',
-            'mean_total_task_events', 'mean_total_soup_delivery']
+            'mean_total_task_events', 'mean_total_soup_delivery',
+            'mean_total_potting', 'mean_total_soup_pickup']
     agg = {}
     for k in keys:
         if k in summaries[0]:
@@ -82,7 +83,10 @@ def main():
                                  'event_density_bonus', 'event_binary_bonus',
                                  'delivery_chain_bonus', 'delivery_chain_raw_clipped',
                                  'normalized', 'weighted_normalized',
-                                 'delta_complementarity'],
+                                 'delta_complementarity',
+                                 'self_task_progress', 'team_task_progress',
+                                 'teammate_task_progress', 'task_lookahead_rule',
+                                 'task_lola_rule', 'team_bottleneck_progress'],
                         help='Shaping bonus type (default none)')
     parser.add_argument('--role_shaping', action='store_true', default=False,
                         help='[DEPRECATED] Use --shaping_type instead')
@@ -98,6 +102,11 @@ def main():
                         choices=['raw_clipped', 'normalized', 'weighted_normalized',
                                  'delta_complementarity'],
                         help='[DEPRECATED] Use --shaping_type')
+    parser.add_argument('--w_onion_pickup', type=float, default=0.1)
+    parser.add_argument('--w_potting', type=float, default=1.0)
+    parser.add_argument('--w_dish_pickup', type=float, default=0.2)
+    parser.add_argument('--w_soup_pickup', type=float, default=0.7)
+    parser.add_argument('--w_delivery', type=float, default=1.0)
     args = parser.parse_args()
 
     # ── Resolve shaping_type, bonus_clip (backward compat) ──
@@ -150,6 +159,11 @@ def main():
             role_bonus_type=args.role_bonus_type or 'raw_clipped',
             shaping_type=shaping_type,
             bonus_clip=bonus_clip,
+            w_onion_pickup=args.w_onion_pickup,
+            w_potting=args.w_potting,
+            w_dish_pickup=args.w_dish_pickup,
+            w_soup_pickup=args.w_soup_pickup,
+            w_delivery=args.w_delivery,
         )
         summary['agent0_type'] = agent0_type
         summary['agent1_type'] = agent1_type
@@ -167,6 +181,12 @@ def main():
         agg['shaping_type'] = shaping_type
         agg['lambda_role'] = args.lambda_role
         agg['role_window'] = args.role_window
+        agg['bonus_clip'] = bonus_clip
+        agg['w_onion_pickup'] = args.w_onion_pickup
+        agg['w_potting'] = args.w_potting
+        agg['w_dish_pickup'] = args.w_dish_pickup
+        agg['w_soup_pickup'] = args.w_soup_pickup
+        agg['w_delivery'] = args.w_delivery
 
     os.makedirs(args.log_dir, exist_ok=True)
     csv_path = os.path.join(args.log_dir, 'summary_all.csv')
