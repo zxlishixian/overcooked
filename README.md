@@ -11,7 +11,7 @@ For example, with two PPO agents (NL+NL), we observe:
 - **Specialization emerges before reward convergence** — T_spec ≈ 47 vs T_reward ≈ 222 (episodes)
 - **Role assignment is emergent, not pre-assigned** — which agent takes which role depends on random initialization, not agent index
 
-This framework is designed to systematically compare different algorithm pairings — currently NL+NL (PPO independent learners), with second-order methods (LOLA, Lookahead) planned for future work.
+This framework is designed to systematically compare different algorithm pairings — currently NL+NL (PPO independent learners), LTS-PPO (Dynamic-Belief-style PPO with teammate modeling), RNN-IPPO (GRU history baseline), with second-order methods (LOLA, Lookahead) planned for future work.
 
 ## Key Concepts
 
@@ -232,7 +232,7 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--layout` | `cramped_room` | Layout name or custom layout key |
-| `--agent0/--agent1` | `nl` | Agent type (`nl` = PPO) |
+| `--agent0/--agent1` | `nl` | Agent type: `nl` (PPO), `lts_ppo` (LTS-PPO), `rnn_ppo` (RNN-IPPO) |
 | `--num_episodes` | 100 | Training episodes |
 | `--horizon` | 400 | Max steps per episode |
 | `--lr` | 1e-3 | Learning rate (Adam) |
@@ -252,10 +252,53 @@ python overcooked_speed/analysis/plot_learning_curves.py \
 | `--w_dish_pickup` | 0.2 | Task weight: dish pickup from dispenser |
 | `--w_soup_pickup` | 0.7 | Task weight: soup pickup from full pot |
 | `--w_delivery` | 1.0 | Task weight: soup delivery to serving station |
+| `--critic_mode` | `normal` | Critic mode: `normal` (V(obs)), `policy_conditioned` (V(obs, teammate_probs)) |
+| `--teammate_probs_mode` | `true` | Teammate probs for PC critic: `true`, `uniform`, `shuffled` |
+| `--save_trajectories` | `False` | Save per-timestep trajectory npz for Phase B training |
+| `--save_model_dir` | `None` | Save model checkpoints after training |
+| `--hidden_dim` | 256 | Actor/critic MLP hidden dimension |
 | `--role_shaping` | `False` | ⚠️ Deprecated — use `--shaping_type raw_clipped` |
 | `--role_bonus_type` | — | ⚠️ Deprecated — use `--shaping_type` |
 | `--role_bonus_clip` | — | ⚠️ Deprecated — use `--bonus_clip` |
 | `--log_dir` | `logs/smoke` | Output directory for CSVs and summary JSON |
+
+**LTS-PPO args** (`--agent0 lts_ppo`):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--lts_preset` | `None` | Preset: `small` (debug), `base`, `no_inter` (ablation) |
+| `--lts_L` | 20 | Intra-history sequence length |
+| `--lts_M` | 10 | Inter-memory episode count (0 = disable) |
+| `--lts_K` | 10 | D_f future lookahead steps |
+| `--lts_belief_dim` | 64 | Belief embedding dimension |
+| `--lts_y_dim` | 16 | Teammate observable state dimension |
+| `--lts_intra_feat_dim` | 23 | Intra-history per-step feature dimension |
+| `--lts_future_dim` | auto | D_f output dim (auto: 6 if no event, 11 with event) |
+| `--lts_c_dim` | 17 | Episode characteristic dimension |
+| `--lts_enc_out_dim` | 64 | Encoder output dimension |
+| `--lts_obs_enc_hidden` | 128 | ObsEncoder MLP hidden dim |
+| `--lts_intra_hidden` | 64 | IntraEncoder GRU hidden dim |
+| `--lts_inter_hidden` | 64 | InterEncoder MLP hidden dim |
+| `--lts_alpha` | 0.1 | D_y loss weight |
+| `--lts_beta` | 0.05 | D_f loss weight |
+| `--lts_eta` | 0.05 | D_c loss weight |
+| `--lts_belief_cons_coef` | 0.0 | Belief consistency reg coefficient |
+| `--lts_belief_lr_scale` | 0.5 | Belief encoder LR scale vs AC |
+| `--lts_df_event` | `False` | Enable event prediction in D_f head |
+
+**RNN-IPPO args** (`--agent0 rnn_ppo`):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--rnn_K` | 10 | RNN-IPPO history length |
+| `--rnn_hidden_dim` | 64 | GRU hidden dimension |
+
+**Fixed-teammate args:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--fixed_teammate` | `None` | Path to fixed teammate checkpoint for agent1 |
+| `--warmup_inter_memory_episodes` | 0 | Warmup episodes for inter-memory before training |
 
 `sweep_pairs.py` adds:
 
@@ -388,6 +431,160 @@ The Spearman correlation is even stronger for total_potting (ρ=0.963) — the *
 
 **Caveats**: Diagnostic sweep was 300ep × 3 seeds; baseline comparisons are against 500ep × 5 seeds. Results may not be directly comparable at the same episode count.
 
+### LTS-PPO: Dynamic-Belief-Style PPO with Teammate Modeling
+
+LTS-PPO equips each agent with a **belief encoder** that models the teammate's latent behavioral state. The belief embedding b_t is built from:
+
+| Branch | Input | Encoder | Output |
+|--------|-------|---------|--------|
+| Observation | o_t (520-dim egocentric) | ObsEncoder: 2-layer MLP | obs_out (64) |
+| Intra-history | L-step intra_feat sequence (23-dim per step) | IntraEncoder: GRU(batch_first=True) | intra_out (64) |
+| Inter-memory | M episode-level characteristics (17-dim each) | InterEncoder: MLP over flattened M×17 | inter_out (64) |
+
+The three branches are concatenated and fused via a Linear(192→belief_dim) + ReLU → belief embedding b_t.
+
+**Actor-Critic:** `[obs (520) || belief (belief_dim)]` → separate actor/critic MLP trunks. Strictly decentralized critic (no global state).
+
+**Three auxiliary heads** from b_t regularize the belief space:
+
+| Head | Target | Loss | Purpose |
+|------|--------|------|---------|
+| D_y | teammate current action (6-dim class) | Cross-Entropy | Coordination signal |
+| D_f | future K-step teammate action histogram | Soft CE [+ optional event BCE] | Future behavior prediction |
+| D_c | episode-level teammate characteristic (17-dim) | MSE (offline) | Cross-episode regularizer |
+
+**Causality guarantees:**
+- Intra-history branch uses only t-1 and earlier data (teammate_y_{t-1}, a_i^{t-1}, r_{t-1}) — simultaneous-action causal
+- Current obs branch provides t-step visual information (includes teammate spatial position)
+- Inter-memory uses only previous episodes — no current-episode information
+- D_y target `a_{-i}^t` is NOT an input to b_t — only a supervision target
+
+**Training:**
+- Single Adam optimizer with param groups: AC at `lr`, belief encoder at `lr * belief_lr_scale` (default 0.5)
+- Each PPO minibatch recomputes beliefs with current encoder (with grad) → PPO loss flows through encoder
+- Rollout-time old_log_prob is fixed (never recomputed)
+- Total loss: `L_ppo_clip + vf_coef * L_value - ent_coef * H + α * L_dy + β * L_df + η * L_dc`
+
+**Key diagnostics:**
+
+| Metric | Meaning | Healthy range |
+|--------|---------|---------------|
+| dy_acc | D_y action prediction accuracy | > 16.7% (random), target > 25% |
+| belief_norm | \|\|b_new\|\|_2 mean | stable, no >2× jumps |
+| belief_delta_mean | \|\|b_new - b_old\|\|_2 mean | < 2.0 |
+| belief_encoder_grad_norm | Gradient norm before clipping | > 0 (non-zero) |
+| ratio_max | Max PPO importance ratio | < 2.0 |
+| clip_fraction | Fraction of ratios clipped | < 0.3 |
+| approx_kl_ppo | E[ratio - 1 - log(ratio)] | < 0.02 |
+| inter_memory_filled | Episodes stored in ring buffer | > 0 after warmup |
+| inter_memory_norm | L2 norm of inter-memory vector | > 0 when non-empty |
+
+**Baselines for ablation:**
+| Baseline | Agent type | Key difference from LTS-PPO |
+|----------|-----------|---------------------------|
+| RNN-IPPO | `rnn_ppo` | GRU over same intra_feat, no belief decomposition, no inter-memory, no aux losses |
+| Parameter-matched IPPO | `nl` with `--hidden_dim 512` | Same total params as LTS-PPO, no teammate modeling |
+
+**Presets:**
+
+| Param | `small` (debug) | `base` | `no_inter` (ablation) |
+|-------|:---:|:---:|:---:|
+| L (intra history) | 5 | 20 | 20 |
+| M (inter memory) | 3 | 10 | 0 |
+| K (D_f lookahead) | 5 | 10 | 10 |
+| belief_dim | 32 | 64 | 64 |
+| hidden_dim (AC, LTS only) | 64 | 256 | 256 |
+| α (D_y) | 0.05 | 0.1 | 0.1 |
+| β (D_f) | 0.02 | 0.05 | 0.05 |
+| η (D_c) | 0.02 | 0.05 | 0.0 |
+
+**Implementation correctness verified** (100ep × 5 configs):
+- dy_acc: 29–33% (> 16.7% random) — D_y is learning
+- belief_encoder_grad_norm: 0.58–1.14 (non-zero) — PPO gradients flow to belief encoder
+- inter_memory_filled: 3 (small) / 0 (no_inter) — inter-memory correctly populated
+- No NaN across all runs
+
+**Quick start:**
+```bash
+# LTS-PPO self-play (small preset for debugging)
+python overcooked_speed/experiments/run_pair.py \
+    --layout cramped_room --agent0 lts_ppo --agent1 lts_ppo \
+    --lts_preset small --num_episodes 100 --seed 0 --log_dir logs/lts_small
+
+# Fixed-teammate sanity check
+python overcooked_speed/experiments/run_pair.py \
+    --layout cramped_room --agent0 lts_ppo --agent1 nl \
+    --lts_preset small --num_episodes 200 --seed 0 \
+    --fixed_teammate logs/nl_baseline/model_agent1.pt \
+    --warmup_inter_memory_episodes 10 --log_dir logs/lts_fixed_tm
+
+# RNN-IPPO baseline
+python overcooked_speed/experiments/run_pair.py \
+    --layout cramped_room --agent0 rnn_ppo --agent1 rnn_ppo \
+    --rnn_K 10 --rnn_hidden_dim 64 --num_episodes 500 --seed 0 \
+    --log_dir logs/rnn_baseline
+
+# Parameter-matched IPPO baseline
+python overcooked_speed/experiments/run_pair.py \
+    --layout cramped_room --agent0 nl --agent1 nl \
+    --hidden_dim 512 --num_episodes 500 --seed 0 --log_dir logs/nl_large
+```
+
+### Phase A: Critic Extra Ablation — Does PC Gain Come from Teammate Policy Info? (500ep × 5 seeds)
+
+IPPO-PC adds teammate action probs π_j(o_j) as critic_extra (6-dim), which improves explained_variance (+3%) and reward (+9%) but increases variance. To check whether the gain comes from real teammate policy information vs simply extra critic capacity, we ablated `--teammate_probs_mode`:
+
+| mode | critic_extra | purpose |
+|---|---|---|
+| `true` | real rollout-time π_j(o_j) | original IPPO-PC |
+| `uniform` | constant [1/6]*6 | capacity control (same dims, no info) |
+| `shuffled` | real π_j, permuted before PPO update | pairing control (secondary) |
+
+**Results:**
+
+| Metric | normal | PC-true | PC-uniform |
+|---|---|---|---|
+| final_reward | 29.6 ± 7.7 | 32.3 ± 15.9 | **38.3 ± 7.8** |
+| reward_auc | 8699 ± 1105 | 9553 ± 3669 | **10186 ± 1791** |
+| T_reward | 299.8 | 333.2 | **283.2** |
+| explained_variance | 0.679 | **0.700** | 0.684 |
+| final_specialization | 0.768 | 0.723 | 0.755 |
+
+**Key conclusion: PC gain is from extra critic capacity, not teammate policy info.** Uniform (38.3) significantly outperforms true (32.3) with lower variance (7.8 vs 15.9). Real teammate probs add noise and training instability rather than useful coordination signal. The higher explained_variance of true (0.700) suggests the critic does use teammate probs to fit returns — but this doesn't translate to better policy or reward.
+
+This is a negative result for the teammate-policy-conditioning hypothesis: the 6-dim critic_extra projection layer alone provides enough capacity improvement, and the information content of π_j(o_j) is not the driver.
+
+### Phase B: Teammate Future Prediction Model — Can History Predict Teammate Actions?
+
+To test whether a learned latent z_j from recent K-step (obs, action) history can predict teammate future actions better than the instantaneous policy snapshot π_j(o_j^t), we trained a GRU-based predictor on 10,000 trajectory episodes (5 seeds × 500ep for both IPPO-normal and IPPO-PC-true, 500k timestep windows).
+
+**Model:** GRU(K=10 × (obs_dim + 6)) → hidden_dim=64 → tanh(Linear → latent_dim=32) = z_j → action_head(32→6, softmax) + event_head(32→5, logits)
+
+**Action prediction (Cross-Entropy on H=10 future action histogram):**
+
+| Predictor | CE ↓ | KL ↓ | Top-1 ↑ | MSE ↓ |
+|---|---|---|---|---|
+| uniform | 1.7918 | 0.4297 | 0.2278 | 0.0216 |
+| global_action_prior | 1.7888 | 0.4268 | 0.1688 | 0.0214 |
+| last_action | 14.4453 | 13.0832 | 0.2516 | 0.1441 |
+| recent_K_histogram | 4.1790 | 2.8169 | 0.3246 | 0.0283 |
+| **current_policy π_j** | **1.7684** | **0.4064** | **0.3779** | 0.0205 |
+| **GRU (ours)** | **1.7629** | **0.4057** | 0.2700 | 0.0205 |
+
+**Success criteria:**
+
+| Criterion | Result |
+|---|---|
+| GRU > current_policy by ≥5% CE | **FAIL** (+0.3%) |
+| GRU > recent_K by ≥5% CE | **PASS** (+57.8%) |
+| latent_std_mean > 0.01 | **PASS** (0.5046) |
+
+**Event prediction:** All 5 event types (onion_pickup, potting_onion, dish_pickup, soup_pickup, soup_delivery) had low precision (<0.30) despite high recall (>0.73). The event head massively overfitted (val BCE: 0.645 → 1.042 across 11 epochs), driven by extreme class imbalance (positive rates 1.5%–11.8%).
+
+**Key conclusion — negative result:** The GRU with K=10 history improves only 0.3% over the instantaneous policy snapshot. Current policy π_j(o_j^t) already captures nearly all predictive information about teammate future actions. The latent z_j is well-formed (non-collapsed, std_mean=0.5046) and convincingly beats simpler temporal baselines (recent-K histogram: +57.8%), but this temporal structure is almost fully redundant with what π_j already encodes.
+
+**Implication for Phase C (Latent Intention Conditioned Critic, V_i(o_i, z_j)):** Not recommended. Since Phase A showed PC gains come from extra capacity (not teammate policy info), and Phase B shows z_j adds negligible predictive value beyond π_j, combining both (PLIC) would likely only add parameter count without meaningful coordination benefit. The negative result justifies sticking with simple critic architectures and investing effort elsewhere.
+
 ### Correlation Analysis Tool
 
 ```bash
@@ -457,10 +654,20 @@ overcooked/
 │
 ├── overcooked_speed/                 # Research framework (this project)
 │   ├── agents/
-│   │   ├── pg_agent.py               # IPPO agent with GAE + clip
+│   │   ├── pg_agent.py               # IPPO agent with GAE + clip + critic_extra support
 │   │   ├── mappo_agent.py            # MAPPO: centralized critic + two actors
+│   │   ├── lts_agent.py              # LTS-PPO: Dynamic-Belief PPO with teammate modeling
+│   │   ├── rnn_agent.py              # RNN-IPPO: GRU history baseline for LTS ablation
 │   │   ├── role_shaping.py           # Role-level LOLA-like teammate-aware bonus
+│   │   ├── teammate_future_predictor.py  # GRU-based teammate future action/event predictor
 │   │   └── policy.py                 # Actor-Critic network (shared MLP)
+│   ├── models/                       # Neural network modules
+│   │   ├── lts_belief.py             # LTS-PPO belief encoder (Obs/Intra/Inter + AuxHeads)
+│   │   ├── lts_actor_critic.py       # Belief-conditioned Actor-Critic
+│   │   └── rnn_actor_critic.py       # GRU-conditioned Actor-Critic (RNN-IPPO)
+│   ├── utils/                        # Feature extraction & memory
+│   │   ├── teammate_features.py      # y_{-i}, intra_feat, episode characteristic extraction
+│   │   └── inter_episode_memory.py   # Cross-episode ring buffer for teammate characteristics
 │   ├── envs/
 │   │   ├── overcooked_wrapper.py     # Unified env API + reward shaping
 │   │   ├── event_tracker.py          # Per-step event counting (state diffs)
@@ -474,6 +681,7 @@ overcooked/
 │   ├── experiments/
 │   │   ├── run_pair.py               # Single pair training + CSV logging
 │   │   ├── sweep_pairs.py            # Multi-seed sweep + aggregation
+│   │   ├── train_future_predictor.py # Phase B: train GRU teammate predictor
 │   │   ├── gen_sweep_scripts.py      # Generate per-GPU shell scripts for sweeps
 │   │   └── launch_task_sweep.py      # Sequential job launcher (alternative)
 │   ├── algos/                        # (future) Algorithm implementations
@@ -487,7 +695,22 @@ overcooked/
 
 ## Future Research Directions
 
-### Phase 2: Second-Order Learning Algorithms
+### Phase 1: Teammate-Aware Critic Conditioning (Completed)
+
+We systematically tested whether adding teammate-related information to the decentralized IPPO critic improves training:
+
+| Phase | Method | Key Result |
+|---|---|---|
+| **1a** | IPPO-PC: V_i(o_i, π_j(o_j)) | +9% reward, +3% ev, but high variance |
+| **1b** | PC ablation (uniform vs true) | **Uniform beats true** (38.3 vs 32.3) — gain is from critic capacity, not teammate info |
+| **1c** | GRU future predictor: z_j from K-step history | GRU only +0.3% CE over current policy — history adds negligible predictive value beyond π_j |
+
+**Overall conclusion:** Teammate policy/intention information, whether from instantaneous policy snapshot or learned temporal latent, does not provide meaningful value beyond simple critic capacity expansion. The bottleneck in decentralized IPPO is not lack of teammate modeling — it's fundamental value estimation in partially-observable cooperative settings.
+
+### Phase 2: LTS-PPO — Latent Teammate State PPO (In Progress)
+Dynamic-Belief-style PPO that models teammate latent behavioral state via belief embedding. Actor and Critic condition on [obs || belief]. Three auxiliary prediction heads (D_y, D_f, D_c) regularize the belief space. Baselines: RNN-IPPO (GRU history, no belief), parameter-matched IPPO. See [LTS-PPO section](#lts-ppo-dynamic-belief-style-ppo-with-teammate-modeling).
+
+### Phase 3: Second-Order Learning Algorithms (Future)
 Implement and benchmark agents that account for *other agents' learning*:
 
 | Algorithm | Key Idea |
@@ -500,18 +723,18 @@ Implement and benchmark agents that account for *other agents' learning*:
 
 **Hypothesis**: LOLA and Lookahead should accelerate T_reward (faster convergence) and produce more stable specialization compared to naive learners, because they account for co-adaptation effects that NL agents treat as environmental noise.
 
-### Phase 3: Algorithm Pair Analysis
+### Phase 4: Algorithm Pair Analysis
 Cross-comparing mixed pairs (e.g., LOLA+NL, LOLA+Lookahead) to study:
 - Does having even one "aware" agent improve convergence for both?
 - Is there an optimal pair for convergence speed vs final performance trade-off?
 - How does algorithm choice affect the *type* of role division that emerges?
 
-### Phase 4: Custom Layout Studies
+### Phase 5: Custom Layout Studies
 The framework supports custom layouts via the `CUSTOM_LAYOUTS` registry. An asymmetric layout (`custom_asymmetric_roles`, 8×5 grid) separates cooking and delivery zones spatially, designed to encourage stronger role specialization. Future work:
 - Measure specialization strength as a function of spatial separation
 - Study whether certain algorithm pairs are more robust to layout changes
 
-### Phase 5: Hyperparameter Sensitivity
+### Phase 6: Hyperparameter Sensitivity
 - Entropy coefficient sweep (current: 0.05)
 - PPO clip range and epoch count
 - Discount factor (γ) effects on multi-agent credit assignment

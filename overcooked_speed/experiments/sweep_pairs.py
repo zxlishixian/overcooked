@@ -27,7 +27,13 @@ def compute_summary_stats(summaries):
             'T_specialization_gated_ok',
             'mean_shaping_applied', 'shaping_clip_rate',
             'mean_total_task_events', 'mean_total_soup_delivery',
-            'mean_total_potting', 'mean_total_soup_pickup']
+            'mean_total_potting', 'mean_total_soup_pickup',
+            # Critic-conditioning diagnostics
+            'mean_a0_return_mean', 'mean_a1_return_mean',
+            'mean_a0_value_mean', 'mean_a1_value_mean',
+            'mean_a0_explained_variance', 'mean_a1_explained_variance',
+            'mean_a0_critic_extra_entropy', 'mean_a1_critic_extra_entropy',
+            'mean_a0_value_extra_sensitivity', 'mean_a1_value_extra_sensitivity']
     agg = {}
     for k in keys:
         if k in summaries[0]:
@@ -75,6 +81,15 @@ def main():
     parser.add_argument('--ppo_epochs', type=int, default=4)
     parser.add_argument('--algo', default='ippo', choices=['ippo', 'mappo'],
                         help='Algorithm: ippo (independent PPO) or mappo (centralized-critic MAPPO)')
+    parser.add_argument('--critic_mode', default='normal',
+                        choices=['normal', 'policy_conditioned'],
+                        help='Critic mode: normal (V(obs)) or '
+                             'policy_conditioned (V(obs, teammate_probs))')
+    parser.add_argument('--teammate_probs_mode', default='true',
+                        choices=['true', 'uniform', 'shuffled'],
+                        help='Teammate probs mode for policy_conditioned critic')
+    parser.add_argument('--save_trajectories', action='store_true', default=False,
+                        help='Save per-timestep trajectory npz for Phase B training')
     parser.add_argument('--obs_mode', default='egocentric',
                         choices=['egocentric', 'global_concat', 'local'],
                         help='Observation mode')
@@ -164,6 +179,9 @@ def main():
             w_dish_pickup=args.w_dish_pickup,
             w_soup_pickup=args.w_soup_pickup,
             w_delivery=args.w_delivery,
+            critic_mode=args.critic_mode,
+            teammate_probs_mode=args.teammate_probs_mode,
+            save_trajectories=args.save_trajectories,
         )
         summary['agent0_type'] = agent0_type
         summary['agent1_type'] = agent1_type
@@ -177,6 +195,8 @@ def main():
     agg['agent1_type'] = agent1_type
     agg['layout'] = args.layout
     agg['seeds'] = args.seeds
+    agg['critic_mode'] = args.critic_mode
+    agg['teammate_probs_mode'] = args.teammate_probs_mode
     if shaping_type != 'none':
         agg['shaping_type'] = shaping_type
         agg['lambda_role'] = args.lambda_role

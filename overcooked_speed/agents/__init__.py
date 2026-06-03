@@ -2,6 +2,8 @@ from .pg_agent import PGAgent
 from .policy import ActorCritic
 from .mappo_agent import MAPPOManager, CentralizedCritic
 from .role_shaping import RoleShapingManager
+from .lts_agent import LTSAgent
+from .rnn_agent import RNNAgent
 
 # Future: from .lola_agent import LOLAAgent
 # Future: from .lookahead_agent import LookaheadAgent
@@ -10,6 +12,8 @@ from .role_shaping import RoleShapingManager
 
 AGENT_REGISTRY = {
     'nl': PGAgent,
+    'lts_ppo': LTSAgent,
+    'rnn_ppo': RNNAgent,
     # 'non': NonAgent,        # TODO: fixed-policy baseline
     # 'lola': LOLAAgent,       # TODO: second-order LOLA
     # 'lookahead': LookaheadAgent,  # TODO: second-order Lookahead
