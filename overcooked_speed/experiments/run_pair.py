@@ -28,51 +28,9 @@ from overcooked_speed.analysis.metrics import (
     gated_overall_specialization,
 )
 from overcooked_speed.agents import create_agent, MAPPOManager, RoleShapingManager
-from overcooked_speed.agents.lts_agent import LTSAgent
+from overcooked_speed.agents.belief_ppo_agent import BeliefPPOAgent
 from overcooked_speed.agents.rnn_agent import RNNAgent
-from overcooked_speed.utils.teammate_features import extract_teammate_y
 
-
-
-def resolve_lts_preset(name):
-    """Resolve named LTS-PPO preset to a dict of overrides.
-
-    Args:
-        name: preset name — 'small', 'base', or 'no_inter'
-
-    Returns:
-        dict of (key, value) overrides for LTS defaults.
-    """
-    presets = {
-        'small': dict(
-            L=5, M=3, K=5, belief_dim=32, hidden_dim=64,
-            enc_out_dim=32, obs_enc_hidden=64,
-            intra_hidden=32, inter_hidden=32,
-            alpha=0.05, beta=0.02, eta=0.02,
-            belief_cons_coef=0.0,
-        ),
-        'base': dict(
-            L=20, M=10, K=10, belief_dim=64, hidden_dim=256,
-            enc_out_dim=64, obs_enc_hidden=128,
-            intra_hidden=64, inter_hidden=64,
-            alpha=0.1, beta=0.05, eta=0.05,
-            belief_cons_coef=0.0,
-        ),
-        'no_inter': dict(
-            L=20, M=0, K=10, belief_dim=64, hidden_dim=256,
-            enc_out_dim=64, obs_enc_hidden=128,
-            intra_hidden=64, inter_hidden=64,
-            alpha=0.1, beta=0.05, eta=0.0,
-            belief_cons_coef=0.0,
-        ),
-    }
-    if name is None:
-        return {}
-    name = name.lower()
-    if name not in presets:
-        raise ValueError(f"Unknown LTS preset '{name}'. "
-                         f"Available: {list(presets.keys())}")
-    return presets[name]
 
 
 def select_device(gpu_id=None):
@@ -214,7 +172,6 @@ def held_to_int(held_obj):
 
 def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
              horizon=400, lr=1e-3, gamma=0.99, hidden_dim=256,
-             nl_hidden_dim=256,
              reward_threshold=20.0, spec_threshold=0.3,
              min_delivery_events=1, min_cooking_events=3,
              reward_shaping=True, ent_coef=0.05, ppo_epochs=4,
@@ -228,16 +185,31 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
              aux_norm_window=100, aux_adv_clip=5.0,
              critic_mode='normal', teammate_probs_mode='true',
              save_trajectories=False,
-             # LTS-PPO args
-             L=20, M=10, K=10, belief_dim=64,
-             intra_feat_dim=23, y_dim=16, future_dim=11, c_dim=17,
-             obs_enc_hidden=128, intra_hidden=64, inter_hidden=64,
-             enc_out_dim=64, alpha=0.1, beta=0.05, eta=0.05,
-             belief_cons_coef=0.0, belief_lr_scale=0.5, df_event=False,
+             # Belief-PPO args
+             belief_dim=32, belief_history_len=10,
+             belief_obs_out=64, belief_hist_out=64,
+             belief_gru_hidden=64, belief_query_dim=64,
+             belief_lr_scale=0.5,
+             belief_rew_coef=0.05, belief_obs_pred_coef=0.0,
+             belief_kl_coef=1e-4, belief_kl_warmup=100,
+             belief_free_nats=1.0,
+             belief_use_memory=False, belief_memory_size=2000,
+             belief_memory_top_percent=0.05, belief_memory_topk_max=20,
+             belief_memory_min_entries=10,
+             belief_memory_include_teammate_action=False,
+             belief_deterministic=False,
+             belief_nonzero_reward_weight=1.0,
+             belief_hidden_dim=None,
+             belief_query_hidden=128,
+             belief_query_outcome_coef=0.01,
+             belief_memory_temperature=0.1,
+             belief_use_historical_context=False,
+             historical_top_percent=0.05,
+             historical_topk_max=40,
+             historical_min_entries=10,
+             historical_attn_dim=64,
              # RNN-IPPO args
              rnn_K=10, rnn_hidden_dim=64,
-             # Fixed teammate
-             fixed_teammate=None, warmup_inter_memory_episodes=0,
              save_model_dir=None):
     """Run one agent pair for num_episodes and log results.
 
@@ -340,27 +312,39 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
                              global_obs_dim=global_obs_dim)
         print(f"MAPPO: actor input={obs_dim}, critic input={global_obs_dim}")
     else:
-        lts_kwargs = dict(
-            L=L, M=M, K=K, belief_dim=belief_dim,
-            intra_feat_dim=intra_feat_dim, y_dim=y_dim,
-            future_dim=future_dim, c_dim=c_dim,
-            obs_enc_hidden=obs_enc_hidden,
-            intra_hidden=intra_hidden, inter_hidden=inter_hidden,
-            enc_out_dim=enc_out_dim,
-            alpha=alpha, beta=beta, eta=eta,
-            belief_cons_coef=belief_cons_coef,
+        belief_kwargs = dict(
+            belief_dim=belief_dim, history_len=belief_history_len,
+            obs_out=belief_obs_out, hist_out=belief_hist_out,
+            gru_hidden=belief_gru_hidden, query_dim=belief_query_dim,
             belief_lr_scale=belief_lr_scale,
-            df_event=df_event,
+            rew_coef=belief_rew_coef, obs_pred_coef=belief_obs_pred_coef,
+            kl_coef=belief_kl_coef, kl_warmup_episodes=belief_kl_warmup,
+            free_nats=belief_free_nats,
+            belief_use_memory=belief_use_memory,
+            memory_size=belief_memory_size,
+            memory_top_percent=belief_memory_top_percent,
+            memory_topk_max=belief_memory_topk_max,
+            memory_min_entries=belief_memory_min_entries,
+            memory_include_teammate_action=belief_memory_include_teammate_action,
+            belief_deterministic=belief_deterministic,
+            belief_nonzero_reward_weight=belief_nonzero_reward_weight,
+            belief_query_hidden=belief_query_hidden,
+            belief_query_outcome_coef=belief_query_outcome_coef,
+            belief_memory_temperature=belief_memory_temperature,
+            belief_use_historical_context=belief_use_historical_context,
+            historical_top_percent=historical_top_percent,
+            historical_topk_max=historical_topk_max,
+            historical_min_entries=historical_min_entries,
+            historical_attn_dim=historical_attn_dim,
         )
         rnn_kwargs = dict(
             K=rnn_K, rnn_hidden_dim=rnn_hidden_dim,
-            intra_feat_dim=intra_feat_dim, y_dim=y_dim,
+            intra_feat_dim=23, y_dim=16,
         )
-        agent_kwargs = {**lts_kwargs, **rnn_kwargs}
+        agent_kwargs = {**belief_kwargs, **rnn_kwargs}
 
-        # hidden_dim from preset (lts_ac_hidden_dim) only applies to LTS agents
-        _hd0 = hidden_dim if agent0_type == 'lts_ppo' else nl_hidden_dim
-        _hd1 = hidden_dim if agent1_type == 'lts_ppo' else nl_hidden_dim
+        _hd0 = belief_hidden_dim if (agent0_type == 'belief_ppo' and belief_hidden_dim is not None) else hidden_dim
+        _hd1 = belief_hidden_dim if (agent1_type == 'belief_ppo' and belief_hidden_dim is not None) else hidden_dim
         agent0 = create_agent(agent0_type, 0, obs_dim, n_actions, lr, gamma, _hd0,
                               device=torch_device, ent_coef=ent_coef,
                               ppo_epochs=ppo_epochs,
@@ -372,38 +356,11 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
                               critic_extra_dim=critic_extra_dim,
                               **agent_kwargs)
 
-        # ── Fixed teammate mode ──
-        if fixed_teammate is not None:
-            ckpt = torch.load(fixed_teammate, map_location=torch_device)
-            # Handle both raw state_dict and dict-wrapped checkpoints
-            if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-                sd = ckpt['model_state_dict']
-            elif isinstance(ckpt, dict) and 'policy' in ckpt:
-                sd = ckpt['policy']
-            else:
-                sd = ckpt
-            agent1.policy.load_state_dict(sd, strict=False)
-            if isinstance(agent1, LTSAgent) and isinstance(ckpt, dict):
-                if 'belief_encoder' in ckpt:
-                    agent1.belief_encoder.load_state_dict(ckpt['belief_encoder'], strict=False)
-            agent1.eval()
-            for p in agent1.policy.parameters():
-                p.requires_grad = False
-            if isinstance(agent1, LTSAgent):
-                for p in agent1.belief_encoder.parameters():
-                    p.requires_grad = False
-            print(f"Fixed teammate loaded from {fixed_teammate} "
-                  f"(frozen, eval mode)")
-            if warmup_inter_memory_episodes > 0 and isinstance(agent0, LTSAgent):
-                print(f"Warming up inter-memory for "
-                      f"{warmup_inter_memory_episodes} episodes...")
-
-    # Agent type checks for LTS/RNN-specific handling
-    is_lts0 = isinstance(agent0, LTSAgent) if algo != 'mappo' else False
-    is_lts1 = isinstance(agent1, LTSAgent) if algo != 'mappo' else False
+    # Agent type checks
+    is_belief0 = isinstance(agent0, BeliefPPOAgent) if algo != 'mappo' else False
+    is_belief1 = isinstance(agent1, BeliefPPOAgent) if algo != 'mappo' else False
     is_rnn0 = isinstance(agent0, RNNAgent) if algo != 'mappo' else False
     is_rnn1 = isinstance(agent1, RNNAgent) if algo != 'mappo' else False
-    _y_dim = y_dim  # used for zero-initialization
 
     tracker = EventTracker()
     episode_rewards = []
@@ -461,27 +418,49 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
     ]
     spec_fields = ['s_delivery', 's_cooking', 's_overall',
                    's_delivery_gated', 's_cooking_gated', 's_overall_gated']
-    lts_diag_fields = [
-        'a0_loss_dy', 'a1_loss_dy',
-        'a0_dy_acc', 'a1_dy_acc',
-        'a0_loss_df', 'a1_loss_df',
-        'a0_loss_df_action', 'a1_loss_df_action',
-        'a0_loss_df_event', 'a1_loss_df_event',
-        'a0_loss_dc', 'a1_loss_dc',
-        'a0_loss_bel_cons', 'a1_loss_bel_cons',
+    belief_diag_fields = [
+        'a0_loss_rew', 'a1_loss_rew',
+        'a0_loss_rew_nonzero', 'a1_loss_rew_nonzero',
+        'a0_nonzero_reward_frac', 'a1_nonzero_reward_frac',
+        'a0_loss_obs', 'a1_loss_obs',
+        'a0_loss_query_outcome', 'a1_loss_query_outcome',
+        'a0_loss_kl', 'a1_loss_kl',
+        'a0_kl_raw', 'a1_kl_raw',
+        'a0_effective_kl_coef', 'a1_effective_kl_coef',
+        'a0_belief_norm', 'a1_belief_norm',
+        'a0_belief_mu_norm', 'a1_belief_mu_norm',
+        'a0_belief_std_mean', 'a1_belief_std_mean',
+        'a0_belief_std_min', 'a1_belief_std_min',
+        'a0_belief_std_max', 'a1_belief_std_max',
+        'a0_belief_logvar_mean', 'a1_belief_logvar_mean',
+        'a0_belief_logvar_min', 'a1_belief_logvar_min',
+        'a0_belief_logvar_max', 'a1_belief_logvar_max',
+        'a0_belief_encoder_grad_norm', 'a1_belief_encoder_grad_norm',
         'a0_ratio_mean', 'a1_ratio_mean',
         'a0_ratio_std', 'a1_ratio_std',
         'a0_ratio_max', 'a1_ratio_max',
         'a0_clip_fraction', 'a1_clip_fraction',
-        'a0_logprob_delta_sq', 'a1_logprob_delta_sq',
-        'a0_approx_kl_ppo', 'a1_approx_kl_ppo',
-        'a0_belief_norm', 'a1_belief_norm',
-        'a0_belief_delta_mean', 'a1_belief_delta_mean',
-        'a0_belief_encoder_grad_norm', 'a1_belief_encoder_grad_norm',
-        'a0_inter_memory_norm', 'a1_inter_memory_norm',
-        'a0_inter_memory_filled', 'a1_inter_memory_filled',
-        'a0_skipped_dy', 'a1_skipped_dy',
-        'a0_skipped_df', 'a1_skipped_df',
+        'a0_memory_size', 'a1_memory_size',
+        'a0_retrieval_k_selected', 'a1_retrieval_k_selected',
+        'a0_retrieval_top_percent', 'a1_retrieval_top_percent',
+        'a0_retrieval_sim_mean_selected', 'a1_retrieval_sim_mean_selected',
+        'a0_retrieval_sim_max', 'a1_retrieval_sim_max',
+        'a0_retrieval_sim_min_selected', 'a1_retrieval_sim_min_selected',
+        'a0_retrieval_sim_gap', 'a1_retrieval_sim_gap',
+        'a0_retrieval_weight_max', 'a1_retrieval_weight_max',
+        'a0_retrieval_weight_min', 'a1_retrieval_weight_min',
+        'a0_retrieval_weight_std', 'a1_retrieval_weight_std',
+        'a0_retrieval_entropy', 'a1_retrieval_entropy',
+        'a0_retrieval_zero_fraction', 'a1_retrieval_zero_fraction',
+        'a0_hist_memory_size', 'a1_hist_memory_size',
+        'a0_hist_k_selected', 'a1_hist_k_selected',
+        'a0_hist_sim_mean_selected', 'a1_hist_sim_mean_selected',
+        'a0_hist_sim_max', 'a1_hist_sim_max',
+        'a0_hist_sim_min_selected', 'a1_hist_sim_min_selected',
+        'a0_hist_sim_gap', 'a1_hist_sim_gap',
+        'a0_hist_attention_entropy', 'a1_hist_attention_entropy',
+        'a0_hist_weight_max', 'a1_hist_weight_max',
+        'a0_hist_weight_std', 'a1_hist_weight_std',
         'a0_param_total', 'a1_param_total',
     ]
 
@@ -492,7 +471,7 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
         extra += aux_fields
     if effective_type != 'none':
         extra += shaping_fields
-    extra += lts_diag_fields
+    extra += belief_diag_fields
 
     fieldnames = (base_fields + a0_event_fields + a1_event_fields +
                   a0_action_fields + a1_action_fields +
@@ -522,12 +501,6 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
         obs0, obs1 = env.reset()
         tracker.reset()
 
-        # Skip warmup episodes for LTS agent during fixed-teammate warmup
-        is_warmup = (fixed_teammate is not None and
-                     warmup_inter_memory_episodes > 0 and
-                     ep < warmup_inter_memory_episodes and
-                     is_lts0)
-
         if algo == 'mappo':
             mappo.train()
         else:
@@ -537,15 +510,15 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
         done = False
         ep_reward = 0.0
 
-        # LTS/RNN: init prev-step tracking vars (t-1 data, zero at step 0)
-        if is_lts0 or is_rnn0:
-            prev_ty0 = np.zeros(_y_dim, dtype=np.float32)
-            prev_a0 = 0
-            prev_r0 = 0.0
-        if is_lts1 or is_rnn1:
-            prev_ty1 = np.zeros(_y_dim, dtype=np.float32)
-            prev_a1 = 0
-            prev_r1 = 0.0
+        # Init prev-step tracking for belief/rnn agents
+        prev_obs0 = np.zeros_like(obs0)
+        prev_obs1 = np.zeros_like(obs1)
+        prev_a0 = 0; prev_r0 = 0.0
+        prev_a1 = 0; prev_r1 = 0.0
+        if is_rnn0:
+            prev_ty0 = np.zeros(16, dtype=np.float32)
+        if is_rnn1:
+            prev_ty1 = np.zeros(16, dtype=np.float32)
 
         # Per-episode trajectory buffers
         ep_traj = None
@@ -556,13 +529,13 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
             }
 
         while not done:
-            # Build intra features BEFORE acting (uses t-1 data for causality)
-            if is_lts0:
-                agent0.build_next_intra_feature(prev_ty0, prev_a0, prev_r0)
+            # Push history BEFORE acting (t-1 data for causality)
+            if is_belief0:
+                agent0.push_history(prev_obs0, prev_a0, prev_r0)
+            if is_belief1:
+                agent1.push_history(prev_obs1, prev_a1, prev_r1)
             if is_rnn0:
                 agent0.build_next_intra_feature(prev_ty0, prev_a0, prev_r0)
-            if is_lts1:
-                agent1.build_next_intra_feature(prev_ty1, prev_a1, prev_r1)
             if is_rnn1:
                 agent1.build_next_intra_feature(prev_ty1, prev_a1, prev_r1)
 
@@ -571,14 +544,12 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
                 a0, a1 = mappo.act(obs0, obs1, global_obs)
                 probs0 = probs1 = np.ones(n_actions, dtype=np.float32) / n_actions
             elif critic_mode == 'policy_conditioned':
-                # Always collect probs when saving trajectories (for any teammate_probs_mode)
                 if teammate_probs_mode in ('true', 'shuffled'):
                     probs0 = agent0.get_action_probs(obs0)
                     probs1 = agent1.get_action_probs(obs1)
                     a0 = agent0.act(obs0, critic_extra=probs1)
                     a1 = agent1.act(obs1, critic_extra=probs0)
                 else:
-                    # uniform mode
                     extra0 = np.ones(6, dtype=np.float32) / 6.0
                     extra1 = np.ones(6, dtype=np.float32) / 6.0
                     a0 = agent0.act(obs0, critic_extra=extra0)
@@ -601,27 +572,27 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
                 agent0.store_reward(reward)
                 agent1.store_reward(reward)
 
-            # ── LTS/RNN: store teammate info & update prev-step vars ──
-            if is_lts0:
-                agent0.store_teammate_info(state_info, a1)
-                prev_ty0 = extract_teammate_y(0, state_info, a1, y_dim=_y_dim)
-                prev_a0 = a0
-                prev_r0 = reward
-            elif is_rnn0:
-                prev_ty0 = extract_teammate_y(0, state_info, a1, y_dim=_y_dim)
+            # Store next obs + teammate action for belief agent (MVP-C)
+            if is_belief0:
+                agent0.store_next_obs(next_obs0)
+                agent0.store_teammate_action(a1)
+            if is_belief1:
+                agent1.store_next_obs(next_obs1)
+                agent1.store_teammate_action(a0)
+
+            # Update prev-step tracking
+            prev_obs0 = obs0.copy()
+            prev_obs1 = obs1.copy()
+            prev_a0 = a0; prev_r0 = reward
+            prev_a1 = a1; prev_r1 = reward
+            if is_rnn0:
+                from overcooked_speed.agents.rnn_agent import _extract_teammate_y as _ety
+                prev_ty0 = _ety(0, state_info, a1)
                 agent0.store_teammate_y(prev_ty0)
-                prev_a0 = a0
-                prev_r0 = reward
-            if is_lts1:
-                agent1.store_teammate_info(state_info, a0)
-                prev_ty1 = extract_teammate_y(1, state_info, a0, y_dim=_y_dim)
-                prev_a1 = a1
-                prev_r1 = reward
-            elif is_rnn1:
-                prev_ty1 = extract_teammate_y(1, state_info, a0, y_dim=_y_dim)
+            if is_rnn1:
+                from overcooked_speed.agents.rnn_agent import _extract_teammate_y as _ety
+                prev_ty1 = _ety(1, state_info, a0)
                 agent1.store_teammate_y(prev_ty1)
-                prev_a1 = a1
-                prev_r1 = reward
 
             # ── Trajectory data collection ──
             if ep_traj is not None:
@@ -740,14 +711,6 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
 
 
         # End-of-episode training
-        # Compute LTS episode characteristics (before end_episode call)
-        c0_vec = None
-        c1_vec = None
-        if is_lts0:
-            c0_vec = agent0.compute_current_characteristic(game_stats)
-        if is_lts1:
-            c1_vec = agent1.compute_current_characteristic(game_stats)
-
         if algo == 'mappo':
             log = mappo.end_episode()
             a0_log = {
@@ -768,48 +731,13 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
             log = {}
             shuffle_extra = (critic_mode == 'policy_conditioned' and
                             teammate_probs_mode == 'shuffled')
-
-            # During warmup, skip training but still collect inter-memory for LTS agent
-            if is_warmup:
-                if is_lts0 and c0_vec is not None and M > 0:
-                    agent0._inter_memory.push(c0_vec)
-                agent0._clear_all_buffers()
-                agent1._clear_buffer()
-                a0_log = agent0._empty_lts_log()
-                a1_log = {
-                    'loss': 0.0, 'mean_return': 0.0, 'entropy': 0.0,
-                    'grad_norm': 0.0, 'approx_kl': 0.0, 'value_loss': 0.0,
-                    'aux_loss': 0.0,
-                    'value_mean': 0.0, 'explained_variance': 0.0,
-                    'critic_extra_entropy': 0.0, 'value_extra_sensitivity': 0.0,
-                    'sensitivity_note': None,
-                    'value_mean_shuffled': None,
-                    'explained_variance_shuffled': None,
-                    'shuffled_diag_note': None,
-                }
-            elif aux_task_loss:
+            if aux_task_loss:
                 a0_log = agent0.end_episode(
-                    aux_adv=aux_adv0, aux_coef=aux_coef,
-                    shuffle_critic_extra=shuffle_extra,
-                    teammate_characteristic=c0_vec)
-                if fixed_teammate is not None:
-                    agent1._clear_buffer()
-                    a1_log = {
-                        'loss': 0.0, 'mean_return': 0.0, 'entropy': 0.0,
-                        'grad_norm': 0.0, 'approx_kl': 0.0, 'value_loss': 0.0,
-                        'aux_loss': 0.0,
-                        'value_mean': 0.0, 'explained_variance': 0.0,
-                        'critic_extra_entropy': 0.0, 'value_extra_sensitivity': 0.0,
-                        'sensitivity_note': None,
-                        'value_mean_shuffled': None,
-                        'explained_variance_shuffled': None,
-                        'shuffled_diag_note': None,
-                    }
-                else:
-                    a1_log = agent1.end_episode(
-                        aux_adv=aux_adv1, aux_coef=aux_coef,
-                        shuffle_critic_extra=shuffle_extra,
-                        teammate_characteristic=c1_vec)
+                    episode_num=ep, aux_adv=aux_adv0, aux_coef=aux_coef,
+                    shuffle_critic_extra=shuffle_extra)
+                a1_log = agent1.end_episode(
+                    episode_num=ep, aux_adv=aux_adv1, aux_coef=aux_coef,
+                    shuffle_critic_extra=shuffle_extra)
                 aux_loss0 = a0_log.get('aux_loss', 0)
                 aux_loss1 = a1_log.get('aux_loss', 0)
                 aux_episode_logs.append({
@@ -822,26 +750,9 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
                 })
             else:
                 a0_log = agent0.end_episode(
-                    shuffle_critic_extra=shuffle_extra,
-                    teammate_characteristic=c0_vec)
-                if fixed_teammate is not None:
-                    # Fixed teammate: frozen, skip training
-                    agent1._clear_buffer()
-                    a1_log = {
-                        'loss': 0.0, 'mean_return': 0.0, 'entropy': 0.0,
-                        'grad_norm': 0.0, 'approx_kl': 0.0, 'value_loss': 0.0,
-                        'aux_loss': 0.0,
-                        'value_mean': 0.0, 'explained_variance': 0.0,
-                        'critic_extra_entropy': 0.0, 'value_extra_sensitivity': 0.0,
-                        'sensitivity_note': None,
-                        'value_mean_shuffled': None,
-                        'explained_variance_shuffled': None,
-                        'shuffled_diag_note': None,
-                    }
-                else:
-                    a1_log = agent1.end_episode(
-                        shuffle_critic_extra=shuffle_extra,
-                        teammate_characteristic=c1_vec)
+                    episode_num=ep, shuffle_critic_extra=shuffle_extra)
+                a1_log = agent1.end_episode(
+                    episode_num=ep, shuffle_critic_extra=shuffle_extra)
 
         # ── Specialization ──
         c0 = counts[0]
@@ -931,21 +842,41 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
             's_delivery_gated': '' if np.isnan(s_del_gated) else s_del_gated,
             's_cooking_gated': '' if np.isnan(s_cook_gated) else s_cook_gated,
             's_overall_gated': '' if np.isnan(s_overall_gated) else s_overall_gated,
-            # LTS/RNN diagnostics
-            'a0_loss_dy': a0_log.get('loss_dy', 0),
-            'a1_loss_dy': a1_log.get('loss_dy', 0),
-            'a0_dy_acc': a0_log.get('dy_acc', 0),
-            'a1_dy_acc': a1_log.get('dy_acc', 0),
-            'a0_loss_df': a0_log.get('loss_df', 0),
-            'a1_loss_df': a1_log.get('loss_df', 0),
-            'a0_loss_df_action': a0_log.get('loss_df_action', 0),
-            'a1_loss_df_action': a1_log.get('loss_df_action', 0),
-            'a0_loss_df_event': a0_log.get('loss_df_event', 0),
-            'a1_loss_df_event': a1_log.get('loss_df_event', 0),
-            'a0_loss_dc': a0_log.get('loss_dc', 0),
-            'a1_loss_dc': a1_log.get('loss_dc', 0),
-            'a0_loss_bel_cons': a0_log.get('loss_bel_cons', 0),
-            'a1_loss_bel_cons': a1_log.get('loss_bel_cons', 0),
+            # Belief-PPO diagnostics
+            'a0_loss_rew': a0_log.get('loss_rew', 0),
+            'a1_loss_rew': a1_log.get('loss_rew', 0),
+            'a0_loss_rew_nonzero': a0_log.get('loss_rew_nonzero', 0),
+            'a1_loss_rew_nonzero': a1_log.get('loss_rew_nonzero', 0),
+            'a0_nonzero_reward_frac': a0_log.get('nonzero_reward_frac', 0),
+            'a1_nonzero_reward_frac': a1_log.get('nonzero_reward_frac', 0),
+            'a0_loss_obs': a0_log.get('loss_obs', 0),
+            'a1_loss_obs': a1_log.get('loss_obs', 0),
+            'a0_loss_query_outcome': a0_log.get('loss_query_outcome', 0),
+            'a1_loss_query_outcome': a1_log.get('loss_query_outcome', 0),
+            'a0_loss_kl': a0_log.get('loss_kl', 0),
+            'a1_loss_kl': a1_log.get('loss_kl', 0),
+            'a0_kl_raw': a0_log.get('kl_raw', 0),
+            'a1_kl_raw': a1_log.get('kl_raw', 0),
+            'a0_effective_kl_coef': a0_log.get('effective_kl_coef', 0),
+            'a1_effective_kl_coef': a1_log.get('effective_kl_coef', 0),
+            'a0_belief_norm': a0_log.get('belief_norm', 0),
+            'a1_belief_norm': a1_log.get('belief_norm', 0),
+            'a0_belief_mu_norm': a0_log.get('belief_mu_norm', 0),
+            'a1_belief_mu_norm': a1_log.get('belief_mu_norm', 0),
+            'a0_belief_std_mean': a0_log.get('belief_std_mean', 0),
+            'a1_belief_std_mean': a1_log.get('belief_std_mean', 0),
+            'a0_belief_std_min': a0_log.get('belief_std_min', 0),
+            'a1_belief_std_min': a1_log.get('belief_std_min', 0),
+            'a0_belief_std_max': a0_log.get('belief_std_max', 0),
+            'a1_belief_std_max': a1_log.get('belief_std_max', 0),
+            'a0_belief_logvar_mean': a0_log.get('belief_logvar_mean', 0),
+            'a1_belief_logvar_mean': a1_log.get('belief_logvar_mean', 0),
+            'a0_belief_logvar_min': a0_log.get('belief_logvar_min', 0),
+            'a1_belief_logvar_min': a1_log.get('belief_logvar_min', 0),
+            'a0_belief_logvar_max': a0_log.get('belief_logvar_max', 0),
+            'a1_belief_logvar_max': a1_log.get('belief_logvar_max', 0),
+            'a0_belief_encoder_grad_norm': a0_log.get('belief_encoder_grad_norm', 0),
+            'a1_belief_encoder_grad_norm': a1_log.get('belief_encoder_grad_norm', 0),
             'a0_ratio_mean': a0_log.get('ratio_mean', 0),
             'a1_ratio_mean': a1_log.get('ratio_mean', 0),
             'a0_ratio_std': a0_log.get('ratio_std', 0),
@@ -954,27 +885,51 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
             'a1_ratio_max': a1_log.get('ratio_max', 0),
             'a0_clip_fraction': a0_log.get('clip_fraction', 0),
             'a1_clip_fraction': a1_log.get('clip_fraction', 0),
-            'a0_logprob_delta_sq': a0_log.get('logprob_delta_sq', 0),
-            'a1_logprob_delta_sq': a1_log.get('logprob_delta_sq', 0),
-            'a0_approx_kl_ppo': a0_log.get('approx_kl_ppo', 0),
-            'a1_approx_kl_ppo': a1_log.get('approx_kl_ppo', 0),
-            'a0_belief_norm': a0_log.get('belief_norm', 0),
-            'a1_belief_norm': a1_log.get('belief_norm', 0),
-            'a0_belief_delta_mean': a0_log.get('belief_delta_mean', 0),
-            'a1_belief_delta_mean': a1_log.get('belief_delta_mean', 0),
-            'a0_belief_encoder_grad_norm': a0_log.get('belief_encoder_grad_norm', 0),
-            'a1_belief_encoder_grad_norm': a1_log.get('belief_encoder_grad_norm', 0),
-            'a0_inter_memory_norm': a0_log.get('inter_memory_norm', 0),
-            'a1_inter_memory_norm': a1_log.get('inter_memory_norm', 0),
-            'a0_inter_memory_filled': a0_log.get('inter_memory_filled', 0),
-            'a1_inter_memory_filled': a1_log.get('inter_memory_filled', 0),
-            'a0_skipped_dy': a0_log.get('skipped_dy', 0),
-            'a1_skipped_dy': a1_log.get('skipped_dy', 0),
-            'a0_skipped_df': a0_log.get('skipped_df', 0),
-            'a1_skipped_df': a1_log.get('skipped_df', 0),
-            'a0_param_total': (isinstance(agent0, (LTSAgent, RNNAgent)) and
+            'a0_memory_size': a0_log.get('memory_size', 0),
+            'a1_memory_size': a1_log.get('memory_size', 0),
+            'a0_retrieval_k_selected': a0_log.get('retrieval_k_selected', 0),
+            'a1_retrieval_k_selected': a1_log.get('retrieval_k_selected', 0),
+            'a0_retrieval_top_percent': a0_log.get('retrieval_top_percent', 0),
+            'a1_retrieval_top_percent': a1_log.get('retrieval_top_percent', 0),
+            'a0_retrieval_sim_mean_selected': a0_log.get('retrieval_sim_mean_selected', 0),
+            'a1_retrieval_sim_mean_selected': a1_log.get('retrieval_sim_mean_selected', 0),
+            'a0_retrieval_sim_max': a0_log.get('retrieval_sim_max', 0),
+            'a1_retrieval_sim_max': a1_log.get('retrieval_sim_max', 0),
+            'a0_retrieval_sim_min_selected': a0_log.get('retrieval_sim_min_selected', 0),
+            'a1_retrieval_sim_min_selected': a1_log.get('retrieval_sim_min_selected', 0),
+            'a0_retrieval_sim_gap': a0_log.get('retrieval_sim_gap', 0),
+            'a1_retrieval_sim_gap': a1_log.get('retrieval_sim_gap', 0),
+            'a0_retrieval_weight_max': a0_log.get('retrieval_weight_max', 0),
+            'a1_retrieval_weight_max': a1_log.get('retrieval_weight_max', 0),
+            'a0_retrieval_weight_min': a0_log.get('retrieval_weight_min', 0),
+            'a1_retrieval_weight_min': a1_log.get('retrieval_weight_min', 0),
+            'a0_retrieval_weight_std': a0_log.get('retrieval_weight_std', 0),
+            'a1_retrieval_weight_std': a1_log.get('retrieval_weight_std', 0),
+            'a0_retrieval_entropy': a0_log.get('retrieval_entropy', 0),
+            'a1_retrieval_entropy': a1_log.get('retrieval_entropy', 0),
+            'a0_retrieval_zero_fraction': a0_log.get('retrieval_zero_fraction', 0),
+            'a1_retrieval_zero_fraction': a1_log.get('retrieval_zero_fraction', 0),
+            'a0_hist_memory_size': a0_log.get('hist_memory_size', 0),
+            'a1_hist_memory_size': a1_log.get('hist_memory_size', 0),
+            'a0_hist_k_selected': a0_log.get('hist_k_selected', 0),
+            'a1_hist_k_selected': a1_log.get('hist_k_selected', 0),
+            'a0_hist_sim_mean_selected': a0_log.get('hist_sim_mean_selected', 0),
+            'a1_hist_sim_mean_selected': a1_log.get('hist_sim_mean_selected', 0),
+            'a0_hist_sim_max': a0_log.get('hist_sim_max', 0),
+            'a1_hist_sim_max': a1_log.get('hist_sim_max', 0),
+            'a0_hist_sim_min_selected': a0_log.get('hist_sim_min_selected', 0),
+            'a1_hist_sim_min_selected': a1_log.get('hist_sim_min_selected', 0),
+            'a0_hist_sim_gap': a0_log.get('hist_sim_gap', 0),
+            'a1_hist_sim_gap': a1_log.get('hist_sim_gap', 0),
+            'a0_hist_attention_entropy': a0_log.get('hist_attention_entropy', 0),
+            'a1_hist_attention_entropy': a1_log.get('hist_attention_entropy', 0),
+            'a0_hist_weight_max': a0_log.get('hist_weight_max', 0),
+            'a1_hist_weight_max': a1_log.get('hist_weight_max', 0),
+            'a0_hist_weight_std': a0_log.get('hist_weight_std', 0),
+            'a1_hist_weight_std': a1_log.get('hist_weight_std', 0),
+            'a0_param_total': (isinstance(agent0, (BeliefPPOAgent, RNNAgent)) and
                               agent0.param_counts.get('total', 0) or 0),
-            'a1_param_total': (isinstance(agent1, (LTSAgent, RNNAgent)) and
+            'a1_param_total': (isinstance(agent1, (BeliefPPOAgent, RNNAgent)) and
                               agent1.param_counts.get('total', 0) or 0),
         }
         if algo == 'mappo':
@@ -1209,33 +1164,18 @@ def run_pair(layout, agent0_type, agent1_type, num_episodes, seed, log_dir,
 
     # ── Save model checkpoints ──
     if save_model_dir is not None and algo != 'mappo':
-        import torch as _torch_save
         os.makedirs(save_model_dir, exist_ok=True)
         for i, agent in enumerate([agent0, agent1]):
             path = os.path.join(save_model_dir, f'model_agent{i}.pt')
-            if isinstance(agent, LTSAgent):
-                _torch_save.save({
-                    'policy': agent.ac_network.state_dict(),
+            if isinstance(agent, BeliefPPOAgent):
+                torch.save({
+                    'ac_network': agent.ac_network.state_dict(),
                     'belief_encoder': agent.belief_encoder.state_dict(),
+                    'reward_predictor': agent.reward_predictor.state_dict(),
                 }, path)
             else:
-                _torch_save.save(agent.policy.state_dict(), path)
+                torch.save(agent.policy.state_dict(), path)
             print(f"Saved model to {path}")
-        # Also save LTS-specific config
-        if isinstance(agent0, LTSAgent) or isinstance(agent1, LTSAgent):
-            import json as _json_save
-            cfg_path = os.path.join(save_model_dir, 'lts_config.json')
-            cfg = {
-                'L': L, 'M': M, 'K': K, 'belief_dim': belief_dim,
-                'y_dim': y_dim, 'intra_feat_dim': intra_feat_dim,
-                'future_dim': (agent0.future_dim if isinstance(agent0, LTSAgent)
-                              else agent1.future_dim if isinstance(agent1, LTSAgent)
-                              else None),
-                'c_dim': c_dim, 'df_event': df_event,
-            }
-            with open(cfg_path, 'w') as f:
-                _json_save.dump(cfg, f, indent=2)
-            print(f"Saved LTS config to {cfg_path}")
 
     return summary, episode_rewards, episode_event_counts
 
@@ -1244,10 +1184,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--layout', default='cramped_room')
     parser.add_argument('--agent0', default='nl',
-                        choices=['nl', 'lts_ppo', 'rnn_ppo'],
+                        choices=['nl', 'belief_ppo', 'rnn_ppo'],
                         help='Agent 0 type')
     parser.add_argument('--agent1', default='nl',
-                        choices=['nl', 'lts_ppo', 'rnn_ppo'],
+                        choices=['nl', 'belief_ppo', 'rnn_ppo'],
                         help='Agent 1 type')
     parser.add_argument('--num_episodes', type=int, default=100)
     parser.add_argument('--horizon', type=int, default=400)
@@ -1337,91 +1277,48 @@ def main():
                         help='Save per-timestep trajectory data as npz for '
                              'Phase B future-predictor training')
 
-    # LTS-PPO arguments
-    lts_group = parser.add_argument_group('LTS-PPO')
-    lts_group.add_argument('--lts_preset', default=None,
-                           choices=['small', 'base', 'no_inter'],
-                           help='LTS-PPO preset: small (debug), base, no_inter (ablation)')
-    lts_group.add_argument('--lts_L', type=int, default=20,
-                           help='Intra-history length (default 20)')
-    lts_group.add_argument('--lts_M', type=int, default=10,
-                           help='Inter-memory episode count (default 10)')
-    lts_group.add_argument('--lts_K', type=int, default=10,
-                           help='D_f lookahead steps (default 10)')
-    lts_group.add_argument('--lts_belief_dim', type=int, default=64,
-                           help='Belief embedding dimension (default 64)')
-    lts_group.add_argument('--lts_y_dim', type=int, default=16,
-                           help='Teammate observable state dimension (default 16)')
-    lts_group.add_argument('--lts_intra_feat_dim', type=int, default=23,
-                           help='Intra-history feature dimension (default 23)')
-    lts_group.add_argument('--lts_future_dim', type=int, default=None,
-                           help='D_f output dimension (auto: 6 if no df_event, 11 with df_event)')
-    lts_group.add_argument('--lts_c_dim', type=int, default=17,
-                           help='Episode characteristic dimension (default 17)')
-    lts_group.add_argument('--lts_enc_out_dim', type=int, default=64,
-                           help='Encoder output dimension (default 64)')
-    lts_group.add_argument('--lts_obs_enc_hidden', type=int, default=128,
-                           help='ObsEncoder hidden dim (default 128)')
-    lts_group.add_argument('--lts_intra_hidden', type=int, default=64,
-                           help='IntraEncoder GRU hidden dim (default 64)')
-    lts_group.add_argument('--lts_inter_hidden', type=int, default=64,
-                           help='InterEncoder MLP hidden dim (default 64)')
-    lts_group.add_argument('--lts_alpha', type=float, default=0.1,
-                           help='D_y loss weight (default 0.1)')
-    lts_group.add_argument('--lts_beta', type=float, default=0.05,
-                           help='D_f loss weight (default 0.05)')
-    lts_group.add_argument('--lts_eta', type=float, default=0.05,
-                           help='D_c loss weight (default 0.05)')
-    lts_group.add_argument('--lts_belief_cons_coef', type=float, default=0.0,
-                           help='Belief consistency reg coefficient (default 0.0)')
-    lts_group.add_argument('--lts_belief_lr_scale', type=float, default=0.5,
-                           help='Belief encoder LR scale relative to AC (default 0.5)')
-    lts_group.add_argument('--lts_df_event', action='store_true', default=False,
-                           help='Enable event prediction in D_f head')
+    # Belief-PPO arguments
+    belief_group = parser.add_argument_group('Belief-PPO')
+    belief_group.add_argument('--belief_dim', type=int, default=32)
+    belief_group.add_argument('--belief_history_len', type=int, default=10)
+    belief_group.add_argument('--belief_obs_out', type=int, default=64)
+    belief_group.add_argument('--belief_hist_out', type=int, default=64)
+    belief_group.add_argument('--belief_gru_hidden', type=int, default=64)
+    belief_group.add_argument('--belief_query_dim', type=int, default=64)
+    belief_group.add_argument('--belief_lr_scale', type=float, default=0.5)
+    belief_group.add_argument('--belief_rew_coef', type=float, default=0.05)
+    belief_group.add_argument('--belief_obs_pred_coef', type=float, default=0.0)
+    belief_group.add_argument('--belief_kl_coef', type=float, default=1e-4)
+    belief_group.add_argument('--belief_kl_warmup', type=int, default=100)
+    belief_group.add_argument('--belief_free_nats', type=float, default=1.0)
+    belief_group.add_argument('--belief_use_memory', action='store_true', default=False)
+    belief_group.add_argument('--belief_memory_size', type=int, default=2000)
+    belief_group.add_argument('--belief_memory_top_percent', type=float, default=0.05)
+    belief_group.add_argument('--belief_memory_topk_max', type=int, default=20)
+    belief_group.add_argument('--belief_memory_min_entries', type=int, default=10)
+    belief_group.add_argument('--belief_memory_include_teammate_action', action='store_true', default=False)
+    belief_group.add_argument('--belief_deterministic', action='store_true', default=False)
+    belief_group.add_argument('--belief_nonzero_reward_weight', type=float, default=1.0)
+    belief_group.add_argument('--belief_hidden_dim', type=int, default=None,
+                              help='Override AC hidden_dim for belief_ppo agents')
+    belief_group.add_argument('--belief_query_hidden', type=int, default=128)
+    belief_group.add_argument('--belief_query_outcome_coef', type=float, default=0.01)
+    belief_group.add_argument('--belief_memory_temperature', type=float, default=0.1)
+    belief_group.add_argument('--belief_use_historical_context', action='store_true', default=False,
+                              help='Enable Dynamic-Belief-style historical context (MVP-C)')
+    belief_group.add_argument('--belief_historical_top_percent', type=float, default=0.05)
+    belief_group.add_argument('--belief_historical_topk_max', type=int, default=40)
+    belief_group.add_argument('--belief_historical_min_entries', type=int, default=10)
+    belief_group.add_argument('--belief_historical_attn_dim', type=int, default=64)
 
     # RNN-IPPO arguments
     rnn_group = parser.add_argument_group('RNN-IPPO')
-    rnn_group.add_argument('--rnn_K', type=int, default=10,
-                           help='RNN-IPPO history length (default 10)')
-    rnn_group.add_argument('--rnn_hidden_dim', type=int, default=64,
-                           help='RNN-IPPO GRU hidden dim (default 64)')
-
-    # Fixed teammate
-    parser.add_argument('--fixed_teammate', default=None,
-                        help='Path to fixed teammate checkpoint for agent1')
-    parser.add_argument('--warmup_inter_memory_episodes', type=int, default=0,
-                        help='Warmup episodes for inter-memory before training '
-                             '(fixed-teammate mode, default 0)')
+    rnn_group.add_argument('--rnn_K', type=int, default=10)
+    rnn_group.add_argument('--rnn_hidden_dim', type=int, default=64)
     parser.add_argument('--save_model_dir', default=None,
                         help='Directory to save model checkpoints after training')
 
     args = parser.parse_args()
-
-    # ── Resolve LTS preset ──
-    preset = resolve_lts_preset(args.lts_preset)
-    lts_kwargs = {
-        'L': preset.get('L', args.lts_L),
-        'M': preset.get('M', args.lts_M),
-        'K': preset.get('K', args.lts_K),
-        'belief_dim': preset.get('belief_dim', args.lts_belief_dim),
-        'y_dim': args.lts_y_dim,
-        'intra_feat_dim': args.lts_intra_feat_dim,
-        'future_dim': args.lts_future_dim,
-        'c_dim': args.lts_c_dim,
-        'enc_out_dim': preset.get('enc_out_dim', args.lts_enc_out_dim),
-        'obs_enc_hidden': preset.get('obs_enc_hidden', args.lts_obs_enc_hidden),
-        'intra_hidden': preset.get('intra_hidden', args.lts_intra_hidden),
-        'inter_hidden': preset.get('inter_hidden', args.lts_inter_hidden),
-        'alpha': preset.get('alpha', args.lts_alpha),
-        'beta': preset.get('beta', args.lts_beta),
-        'eta': preset.get('eta', args.lts_eta),
-        'belief_cons_coef': preset.get('belief_cons_coef', args.lts_belief_cons_coef),
-        'belief_lr_scale': args.lts_belief_lr_scale,
-        'df_event': args.lts_df_event,
-    }
-    # Preset hidden_dim only applies to LTS agents; NL/RNN agents use args.hidden_dim
-    lts_ac_hidden_dim = preset.get('hidden_dim', args.hidden_dim)
-    nl_hidden_dim = args.hidden_dim
 
     # ── Resolve shaping_type, bonus_clip (backward compat) ──
     shaping_type = args.shaping_type
@@ -1455,8 +1352,7 @@ def main():
         horizon=args.horizon,
         lr=args.lr,
         gamma=args.gamma,
-        hidden_dim=lts_ac_hidden_dim,
-        nl_hidden_dim=nl_hidden_dim,
+        hidden_dim=args.hidden_dim,
         reward_threshold=args.reward_threshold,
         spec_threshold=args.spec_threshold,
         min_delivery_events=args.min_delivery_events,
@@ -1487,14 +1383,39 @@ def main():
         critic_mode=args.critic_mode,
         teammate_probs_mode=args.teammate_probs_mode,
         save_trajectories=args.save_trajectories,
-        # LTS-PPO
-        **lts_kwargs,
+        # Belief-PPO
+        belief_dim=args.belief_dim,
+        belief_history_len=args.belief_history_len,
+        belief_obs_out=args.belief_obs_out,
+        belief_hist_out=args.belief_hist_out,
+        belief_gru_hidden=args.belief_gru_hidden,
+        belief_query_dim=args.belief_query_dim,
+        belief_lr_scale=args.belief_lr_scale,
+        belief_rew_coef=args.belief_rew_coef,
+        belief_obs_pred_coef=args.belief_obs_pred_coef,
+        belief_kl_coef=args.belief_kl_coef,
+        belief_kl_warmup=args.belief_kl_warmup,
+        belief_free_nats=args.belief_free_nats,
+        belief_use_memory=args.belief_use_memory,
+        belief_memory_size=args.belief_memory_size,
+        belief_memory_top_percent=args.belief_memory_top_percent,
+        belief_memory_topk_max=args.belief_memory_topk_max,
+        belief_memory_min_entries=args.belief_memory_min_entries,
+        belief_memory_include_teammate_action=args.belief_memory_include_teammate_action,
+        belief_deterministic=args.belief_deterministic,
+        belief_nonzero_reward_weight=args.belief_nonzero_reward_weight,
+        belief_hidden_dim=args.belief_hidden_dim,
+        belief_query_hidden=args.belief_query_hidden,
+        belief_query_outcome_coef=args.belief_query_outcome_coef,
+        belief_memory_temperature=args.belief_memory_temperature,
+        belief_use_historical_context=args.belief_use_historical_context,
+        historical_top_percent=args.belief_historical_top_percent,
+        historical_topk_max=args.belief_historical_topk_max,
+        historical_min_entries=args.belief_historical_min_entries,
+        historical_attn_dim=args.belief_historical_attn_dim,
         # RNN-IPPO
         rnn_K=args.rnn_K,
         rnn_hidden_dim=args.rnn_hidden_dim,
-        # Fixed teammate
-        fixed_teammate=args.fixed_teammate,
-        warmup_inter_memory_episodes=args.warmup_inter_memory_episodes,
         save_model_dir=args.save_model_dir,
     )
 
